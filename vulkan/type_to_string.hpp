@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -38,6 +38,10 @@ static inline const char *layout_to_string(VkImageLayout layout)
 		return "DS";
 	case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
 		return "COLOR";
+	case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL:
+		return "ATTACHMENT";
+	case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL:
+		return "READ_ONLY";
 	case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
 		return "TRANSFER_DST";
 	case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:

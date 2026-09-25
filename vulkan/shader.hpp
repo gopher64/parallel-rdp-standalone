@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -42,13 +42,10 @@ class Device;
 enum class ShaderStage
 {
 	Vertex = 0,
-	TessControl = 1,
-	TessEvaluation = 2,
-	Geometry = 3,
-	Fragment = 4,
-	Compute = 5,
-	Task = 6,
-	Mesh = 7,
+	Fragment = 4, // Skip over tess/geom to match Vulkan ordering.
+	Compute,
+	Task,
+	Mesh,
 	Count
 };
 
@@ -60,7 +57,7 @@ struct ResourceLayout
 	uint32_t push_constant_size = 0;
 	uint32_t spec_constant_mask = 0;
 	uint32_t bindless_set_mask = 0;
-	enum { Version = 4 };
+	enum { Version = 7 };
 
 	bool unserialize(const uint8_t *data, size_t size);
 	bool serialize(uint8_t *data, size_t size) const;
@@ -83,21 +80,45 @@ struct CombinedResourceLayout
 	Util::Hash push_constant_layout_hash = 0;
 };
 
-union ResourceBinding
+union CombinedImageSamplerIndex
 {
 	struct
 	{
-		VkDescriptorBufferInfo dynamic;
-		VkDescriptorBufferInfo push;
-	} buffer;
+		uint32_t image_heap_index : 20;
+		uint32_t sampler_heap_index : 12;
+	};
+	uint32_t word;
+};
+static_assert(sizeof(CombinedImageSamplerIndex) == sizeof(uint32_t), "Unexpected size of CombinedImageSamplerIndex.");
+
+union ResourceBinding
+{
+	VkDescriptorBufferInfo buffer;
 
 	struct
 	{
 		VkDescriptorImageInfo fp;
 		VkDescriptorImageInfo integer;
+		const uint8_t *fp_ptr;
+		const uint8_t *integer_ptr;
+		const uint8_t *sampler_ptr;
+		CombinedImageSamplerIndex fp_heap_index;
+		CombinedImageSamplerIndex integer_heap_index;
 	} image;
 
-	VkBufferView buffer_view;
+	VkDescriptorAddressInfoEXT buffer_addr_buffer;
+	VkDeviceAddressRangeEXT buffer_addr_heap;
+	VkAccelerationStructureKHR rtas;
+
+	union
+	{
+		VkBufferView handle;
+		struct
+		{
+			const uint8_t *ptr;
+			uint32_t heap_index;
+		} buffer;
+	} buffer_view;
 };
 
 struct ResourceBindings
@@ -106,6 +127,12 @@ struct ResourceBindings
 	uint64_t cookies[VULKAN_NUM_DESCRIPTOR_SETS][VULKAN_NUM_BINDINGS];
 	uint64_t secondary_cookies[VULKAN_NUM_DESCRIPTOR_SETS][VULKAN_NUM_BINDINGS];
 	uint8_t push_constant_data[VULKAN_PUSH_CONSTANT_SIZE];
+
+	union
+	{
+		uint32_t push_data_words[(VULKAN_PUSH_DATA_SIZE - VULKAN_PUSH_CONSTANT_SIZE) / (VULKAN_NUM_DESCRIPTOR_SETS * sizeof(uint32_t))];
+		VkDeviceAddress push_data_addr[(VULKAN_PUSH_DATA_SIZE - VULKAN_PUSH_CONSTANT_SIZE) / (VULKAN_NUM_DESCRIPTOR_SETS * sizeof(VkDeviceAddress))];
+	} inline_descriptors[VULKAN_NUM_DESCRIPTOR_SETS];
 };
 
 struct ImmutableSamplerBank
@@ -118,7 +145,7 @@ class PipelineLayout : public HashedObject<PipelineLayout>
 {
 public:
 	PipelineLayout(Util::Hash hash, Device *device, const CombinedResourceLayout &layout,
-	               const ImmutableSamplerBank *sampler_bank);
+				   const ImmutableSamplerBank *sampler_bank);
 	~PipelineLayout();
 
 	const CombinedResourceLayout &get_resource_layout() const
@@ -126,6 +153,7 @@ public:
 		return layout;
 	}
 
+	// Legacy
 	VkPipelineLayout get_layout() const
 	{
 		return pipe_layout;
@@ -146,6 +174,83 @@ public:
 		return push_set_index;
 	}
 
+	// Heap
+	enum class DescriptorStrategy
+	{
+		// For images: a u32 index. For buffers: PUSH_ADDRESS.
+		Inline,
+		// Not compatible with array of samplers or combined image samplers.
+		// Not compatible with SSBO that need ArrayLength.
+		HeapSlice,
+		// Indirect version of inline, for larger sets.
+		IndirectTable,
+	};
+
+	// Allocation size from indirection table UBO.
+	uint32_t get_heap_table_size(uint32_t desc_set) const
+	{
+		return heap.heap_table_size[desc_set];
+	}
+
+	// Allocation size from descriptor heap.
+	// Used when we want to copy descriptors straight into the heap.
+	uint32_t get_heap_slice_size(uint32_t desc_set) const
+	{
+		return heap.heap_slice_size[desc_set];
+	}
+
+	uint32_t get_descriptor_set_push_buffer_offset(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.push_buffer_offsets[desc_set];
+	}
+
+	uint32_t get_descriptor_set_push_image_offset(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.push_image_offsets[desc_set];
+	}
+
+	uint32_t get_descriptor_set_inline_offsets(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.push_inline_offsets[desc_set];
+	}
+
+	uint32_t get_descriptor_set_inline_size(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.push_inline_size[desc_set];
+	}
+
+	DescriptorStrategy get_heap_buffer_descriptor_strategy(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.buffer_strategies[desc_set];
+	}
+
+	DescriptorStrategy get_heap_image_descriptor_strategy(uint32_t desc_set) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		return heap.image_strategies[desc_set];
+	}
+
+	// Inline: local offset into inline push data
+	// HeapSlice: offset into allocated heap slice
+	// IndirectTable: offset into indirect table
+	uint32_t get_descriptor_offset(uint32_t desc_set, uint32_t binding) const
+	{
+		VK_ASSERT(desc_set < VULKAN_NUM_DESCRIPTOR_SETS);
+		VK_ASSERT(binding < VULKAN_NUM_BINDINGS);
+		return heap.desc_offsets[desc_set][binding];
+	}
+
+	// Passed directly to CreatePipeline.
+	const std::vector<VkDescriptorSetAndBindingMappingEXT> &get_heap_mappings() const
+	{
+		return heap.mappings;
+	}
+
 private:
 	Device *device;
 	VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
@@ -154,6 +259,30 @@ private:
 	VkDescriptorUpdateTemplate update_template[VULKAN_NUM_DESCRIPTOR_SETS] = {};
 	uint32_t push_set_index = UINT32_MAX;
 	void create_update_templates();
+
+	void init_heap();
+	void init_heap(uint32_t set_index);
+	void init_heap_buffers(uint32_t set_index);
+	void init_heap_image(uint32_t set_index);
+	void init_heap_offsets(uint32_t set_index);
+	void init_legacy(const ImmutableSamplerBank *immutable_samplers);
+
+	struct
+	{
+		std::vector<VkDescriptorSetAndBindingMappingEXT> mappings;
+		// Inline descriptors are packed together.
+		uint32_t push_inline_offsets[VULKAN_NUM_DESCRIPTOR_SETS];
+		uint32_t push_inline_size[VULKAN_NUM_DESCRIPTOR_SETS];
+		// For tables and slices.
+		uint32_t push_buffer_offsets[VULKAN_NUM_DESCRIPTOR_SETS];
+		uint32_t push_image_offsets[VULKAN_NUM_DESCRIPTOR_SETS];
+		uint32_t heap_table_size[VULKAN_NUM_DESCRIPTOR_SETS];
+		uint32_t heap_slice_size[VULKAN_NUM_DESCRIPTOR_SETS];
+		DescriptorStrategy buffer_strategies[VULKAN_NUM_DESCRIPTOR_SETS];
+		DescriptorStrategy image_strategies[VULKAN_NUM_DESCRIPTOR_SETS];
+		uint32_t desc_offsets[VULKAN_NUM_DESCRIPTOR_SETS][VULKAN_NUM_BINDINGS];
+		uint32_t push_data_size;
+	} heap = {};
 };
 
 class Shader : public HashedObject<Shader>
@@ -197,7 +326,7 @@ public:
 	Program(Device *device, Shader *compute, const ImmutableSamplerBank *sampler_bank);
 	~Program();
 
-	inline const Shader *get_shader(ShaderStage stage) const
+	inline Shader *get_shader(ShaderStage stage) const
 	{
 		return shaders[Util::ecast(stage)];
 	}

@@ -944,6 +944,9 @@ DerivedSetup Renderer::build_derived_attributes(const AttributeSetup &attr) cons
 	for (unsigned i = 0; i < 4; i++)
 		setup.convert_factors[i] = int16_t(constants.convert[i]);
 
+	for (unsigned i = 0; i < 3; i++)
+		setup.key_width[i] = constants.key_width[i];
+
 	return setup;
 }
 

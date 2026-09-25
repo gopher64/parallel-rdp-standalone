@@ -75,7 +75,8 @@ enum StaticRasterizationFlagBits
 	// Bit 26 and 27 holds upscaling factor in LOG2.
 	RASTERIZATION_NEED_NOISE_BIT = 1 << 28,
 	RASTERIZATION_USE_STATIC_TEXTURE_SIZE_FORMAT_BIT = 1 << 29,
-	RASTERIZATION_USE_SPECIALIZATION_CONSTANT_BIT = 1 << 30
+	RASTERIZATION_USE_SPECIALIZATION_CONSTANT_BIT = 1 << 30,
+	RASTERIZATION_KEY_ENABLE_BIT = 1u << 31
 };
 using StaticRasterizationFlags = uint32_t;
 
@@ -135,11 +136,12 @@ struct DerivedSetup
 	uint8_t dz_compressed;
 	uint8_t min_lod;
 	int16_t convert_factors[4];
+	uint16_t key_width[4];
 };
 
 static_assert((sizeof(TriangleSetup) & 15) == 0, "TriangleSetup must be aligned to 16 bytes.");
 static_assert((sizeof(AttributeSetup) & 15) == 0, "AttributeSetup must be aligned to 16 bytes.");
-static_assert(sizeof(DerivedSetup) == 56, "DerivedSetup is not 56 bytes.");
+static_assert(sizeof(DerivedSetup) == 64, "DerivedSetup is not 64 bytes.");
 
 struct ScissorState
 {

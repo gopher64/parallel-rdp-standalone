@@ -66,6 +66,7 @@ const int RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET = 26;
 const int RASTERIZATION_NEED_NOISE_BIT = 1 << 28;
 const int RASTERIZATION_USE_STATIC_TEXTURE_SIZE_FORMAT_BIT = 1 << 29;
 const int RASTERIZATION_USE_SPECIALIZATION_CONSTANT_BIT = 1 << 30;
+const uint RASTERIZATION_KEY_ENABLE_BIT = 1u << 31;
 
 const int DEPTH_BLEND_DEPTH_TEST_BIT = 1 << 0;
 const int DEPTH_BLEND_DEPTH_UPDATE_BIT = 1 << 1;
@@ -173,6 +174,8 @@ struct DerivedSetupMem
 	mem_u8 min_lod;
 
 	mem_i16x4 factors;
+
+	mem_u16x4 key_width;
 };
 
 #if SMALL_TYPES
@@ -199,6 +202,8 @@ struct DerivedSetup
 	u8 min_lod;
 
 	i16x4 factors;
+
+	u16x4 key_width;
 };
 #endif
 

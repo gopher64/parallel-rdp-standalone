@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -62,7 +62,7 @@ struct RenderPassInfo
 	VkRect2D render_area = { { 0, 0 }, { UINT32_MAX, UINT32_MAX } };
 
 	VkClearColorValue clear_color[VULKAN_NUM_ATTACHMENTS] = {};
-	VkClearDepthStencilValue clear_depth_stencil = { 1.0f, 0 };
+	VkClearDepthStencilValue clear_depth_stencil = {};
 
 	enum class DepthStencil
 	{

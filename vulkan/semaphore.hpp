@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -59,6 +59,11 @@ public:
 	{
 		VK_ASSERT(!owned && semaphore_type == VK_SEMAPHORE_TYPE_TIMELINE_KHR);
 		return timeline;
+	}
+
+	bool is_owned() const
+	{
+		return owned;
 	}
 
 	VkSemaphore consume()

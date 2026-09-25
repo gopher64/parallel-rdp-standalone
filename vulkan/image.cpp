@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -26,15 +26,15 @@
 
 namespace Vulkan
 {
-ImageView::ImageView(Device *device_, VkImageView view_, const ImageViewCreateInfo &info_)
-    : Cookie(device_)
-    , device(device_)
-    , view(view_)
-    , info(info_)
+ImageView::ImageView(Device *device_, const CachedImageView &view_, const ImageViewCreateInfo &info_)
+	: Cookie(device_)
+	, device(device_)
+	, view(view_)
+	, info(info_)
 {
 }
 
-VkImageView ImageView::get_render_target_view(unsigned layer) const
+const CachedImageView &ImageView::get_render_target_view(unsigned layer) const
 {
 	// Transient images just have one layer.
 	if (info.image->get_create_info().domain == ImageDomain::Transient)
@@ -51,48 +51,64 @@ VkImageView ImageView::get_render_target_view(unsigned layer) const
 	}
 }
 
-ImageView::~ImageView()
+const CachedImageView &ImageView::get_mip_view(unsigned level) const
 {
-	if (internal_sync)
-	{
-		device->destroy_image_view_nolock(view);
-		if (depth_view != VK_NULL_HANDLE)
-			device->destroy_image_view_nolock(depth_view);
-		if (stencil_view != VK_NULL_HANDLE)
-			device->destroy_image_view_nolock(stencil_view);
-		if (unorm_view != VK_NULL_HANDLE)
-			device->destroy_image_view_nolock(unorm_view);
-		if (srgb_view != VK_NULL_HANDLE)
-			device->destroy_image_view_nolock(srgb_view);
+	VK_ASSERT(level < get_create_info().levels);
 
-		for (auto &v : render_target_views)
-			device->destroy_image_view_nolock(v);
-	}
+	if (mip_views.empty())
+		return view;
 	else
 	{
-		device->destroy_image_view(view);
-		if (depth_view != VK_NULL_HANDLE)
-			device->destroy_image_view(depth_view);
-		if (stencil_view != VK_NULL_HANDLE)
-			device->destroy_image_view(stencil_view);
-		if (unorm_view != VK_NULL_HANDLE)
-			device->destroy_image_view(unorm_view);
-		if (srgb_view != VK_NULL_HANDLE)
-			device->destroy_image_view(srgb_view);
-
-		for (auto &v : render_target_views)
-			device->destroy_image_view(v);
+		VK_ASSERT(level < mip_views.size());
+		return mip_views[level];
 	}
+}
+
+void ImageView::free_cached_view(CachedImageView &cached)
+{
+	if (internal_sync)
+		device->destroy_image_view_nolock(cached);
+	else
+		device->destroy_image_view(cached);
+}
+
+ImageView::~ImageView()
+{
+	free_cached_view(view);
+	free_cached_view(depth_view);
+	free_cached_view(stencil_view);
+	free_cached_view(unorm_view);
+	free_cached_view(srgb_view);
+	for (auto &v : render_target_views)
+		free_cached_view(v);
+	for (auto &v : mip_views)
+		free_cached_view(v);
 }
 
 unsigned ImageView::get_view_width() const
 {
-	return info.image->get_width(info.base_level);
+	unsigned width = info.image->get_width(info.base_level);
+
+	if (info.aspect == VK_IMAGE_ASPECT_PLANE_1_BIT || info.aspect == VK_IMAGE_ASPECT_PLANE_2_BIT)
+	{
+		unsigned h = 0;
+		format_ycbcr_downsample_dimensions(info.image->get_format(), info.aspect, width, h);
+	}
+
+	return width;
 }
 
 unsigned ImageView::get_view_height() const
 {
-	return info.image->get_height(info.base_level);
+	unsigned height = info.image->get_height(info.base_level);
+
+	if (info.aspect == VK_IMAGE_ASPECT_PLANE_1_BIT || info.aspect == VK_IMAGE_ASPECT_PLANE_2_BIT)
+	{
+		unsigned w = 0;
+		format_ycbcr_downsample_dimensions(info.image->get_format(), info.aspect, w, height);
+	}
+
+	return height;
 }
 
 unsigned ImageView::get_view_depth() const
@@ -100,7 +116,7 @@ unsigned ImageView::get_view_depth() const
 	return info.image->get_depth(info.base_level);
 }
 
-Image::Image(Device *device_, VkImage image_, VkImageView default_view, const DeviceAllocation &alloc_,
+Image::Image(Device *device_, VkImage image_, const CachedImageView &default_view, const DeviceAllocation &alloc_,
              const ImageCreateInfo &create_info_, VkImageViewType view_type)
     : Cookie(device_)
     , device(device_)
@@ -108,7 +124,7 @@ Image::Image(Device *device_, VkImage image_, VkImageView default_view, const De
     , alloc(alloc_)
     , create_info(create_info_)
 {
-	if (default_view != VK_NULL_HANDLE)
+	if (view_type != VK_IMAGE_VIEW_TYPE_MAX_ENUM)
 	{
 		ImageViewCreateInfo info;
 		info.image = this;

@@ -484,6 +484,7 @@ void CommandProcessor::op_set_other_modes(const uint32_t *words)
 	STATE_MASK(static_state.flags, bool(words[0] & (1 << 11)), RASTERIZATION_BILERP_0_BIT);
 	STATE_MASK(static_state.flags, bool(words[0] & (1 << 10)), RASTERIZATION_BILERP_1_BIT);
 	STATE_MASK(static_state.flags, bool(words[0] & (1 << 9)), RASTERIZATION_CONVERT_ONE_BIT);
+	STATE_MASK(static_state.flags, bool(words[0] & (1 << 8)), RASTERIZATION_KEY_ENABLE_BIT);
 	STATE_MASK(depth_blend.flags, bool(words[1] & (1 << 14)), DEPTH_BLEND_FORCE_BLEND_BIT);
 	STATE_MASK(static_state.flags, bool(words[1] & (1 << 13)), RASTERIZATION_ALPHA_CVG_SELECT_BIT);
 	STATE_MASK(static_state.flags, bool(words[1] & (1 << 12)), RASTERIZATION_CVG_TIMES_ALPHA_BIT);

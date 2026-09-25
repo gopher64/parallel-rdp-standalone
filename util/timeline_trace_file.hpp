@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -47,6 +47,7 @@ public:
 		char desc[256];
 		char tid[32];
 		uint32_t pid;
+		uint64_t counter;
 		uint64_t start_ns, end_ns;
 
 		void set_desc(const char *desc);

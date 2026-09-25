@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -25,6 +25,7 @@
 #include "vulkan_headers.hpp"
 #include "vulkan_common.hpp"
 #include "cookie.hpp"
+#include "small_vector.hpp"
 
 namespace Vulkan
 {
@@ -38,6 +39,7 @@ struct IndirectLayoutToken
 		Invalid = 0,
 		Shader,
 		PushConstant,
+		SequenceCount,
 		VBO,
 		IBO,
 		Draw,
@@ -55,7 +57,6 @@ struct IndirectLayoutToken
 		{
 			uint32_t offset;
 			uint32_t range;
-			const PipelineLayout *layout;
 		} push;
 
 		struct
@@ -68,24 +69,25 @@ struct IndirectLayoutToken
 class IndirectLayout : public HashedObject<IndirectLayout>
 {
 public:
-	IndirectLayout(Device *device, const IndirectLayoutToken *token, uint32_t num_tokens, uint32_t stride);
+	IndirectLayout(Device *device, const PipelineLayout *layout, const IndirectLayoutToken *token,
+	               uint32_t num_tokens, uint32_t stride);
 	~IndirectLayout();
 
-	VkIndirectCommandsLayoutNV get_layout() const
+	VkIndirectCommandsLayoutEXT get_layout() const
 	{
 		return layout;
 	}
 
-	VkPipelineBindPoint get_bind_point() const
+	VkShaderStageFlags get_shader_stages() const
 	{
-		return bind_point;
+		return stages;
 	}
 
 private:
 	friend class Device;
 
 	Device *device;
-	VkIndirectCommandsLayoutNV layout;
-	VkPipelineBindPoint bind_point;
+	VkIndirectCommandsLayoutEXT layout;
+	VkShaderStageFlags stages;
 };
 }

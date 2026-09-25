@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -26,6 +26,7 @@
 #include "vulkan_common.hpp"
 #include "vulkan_headers.hpp"
 #include "object_pool.hpp"
+#include "memory_allocator.hpp"
 
 namespace Vulkan
 {
@@ -81,6 +82,12 @@ public:
 		return sampler;
 	}
 
+	const CachedDescriptorPayload &get_descriptor_payload() const
+	{
+		VK_ASSERT(payload && payload.type == VK_DESCRIPTOR_TYPE_SAMPLER);
+		return payload;
+	}
+
 	const SamplerCreateInfo &get_create_info() const
 	{
 		return create_info;
@@ -95,6 +102,7 @@ private:
 
 	Device *device;
 	VkSampler sampler;
+	CachedDescriptorPayload payload = {};
 	SamplerCreateInfo create_info;
 	bool immutable;
 };

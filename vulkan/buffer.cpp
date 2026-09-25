@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -43,15 +43,18 @@ ExternalHandle Buffer::export_handle()
 
 Buffer::~Buffer()
 {
-	if (internal_sync)
+	if (owns_buffer)
 	{
-		device->destroy_buffer_nolock(buffer);
-		device->free_memory_nolock(alloc);
-	}
-	else
-	{
-		device->destroy_buffer(buffer);
-		device->free_memory(alloc);
+		if (internal_sync)
+		{
+			device->destroy_buffer_nolock(buffer);
+			device->free_memory_nolock(alloc);
+		}
+		else
+		{
+			device->destroy_buffer(buffer);
+			device->free_memory(alloc);
+		}
 	}
 }
 
@@ -60,23 +63,22 @@ void BufferDeleter::operator()(Buffer *buffer)
 	buffer->device->handle_pool.buffers.free(buffer);
 }
 
-BufferView::BufferView(Device *device_, VkBufferView view_, const BufferViewCreateInfo &create_info_)
-    : Cookie(device_)
-    , device(device_)
-    , view(view_)
-    , info(create_info_)
+BufferView::BufferView(Device *device_,
+                       const CachedBufferView &view_,
+                       const BufferViewCreateInfo &create_info_)
+	: Cookie(device_)
+	, device(device_)
+	, view(view_)
+	, info(create_info_)
 {
 }
 
 BufferView::~BufferView()
 {
-	if (view != VK_NULL_HANDLE)
-	{
-		if (internal_sync)
-			device->destroy_buffer_view_nolock(view);
-		else
-			device->destroy_buffer_view(view);
-	}
+	if (internal_sync)
+		device->destroy_buffer_view_nolock(view);
+	else
+		device->destroy_buffer_view(view);
 }
 
 void BufferViewDeleter::operator()(BufferView *view)

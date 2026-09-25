@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -60,42 +60,73 @@ struct DeviceFeatures
 	bool supports_video_decode_queue = false;
 	bool supports_video_decode_h264 = false;
 	bool supports_video_decode_h265 = false;
+	bool supports_video_decode_av1 = false;
 	bool supports_astc_decode_mode = false;
 	bool supports_image_format_list = false;
 	bool supports_format_feature_flags2 = false;
 	bool supports_video_encode_queue = false;
 	bool supports_video_encode_h264 = false;
 	bool supports_video_encode_h265 = false;
+	bool supports_video_encode_av1 = false;
 	bool supports_external = false;
 	bool supports_tooling_info = false;
 	bool supports_hdr_metadata = false;
 	bool supports_swapchain_colorspace = false;
 	bool supports_surface_maintenance1 = false;
 	bool supports_store_op_none = false;
-	bool supports_push_descriptor = false;
+	bool supports_low_latency2_nv = false;
+	bool supports_drm_modifiers = false;
+	bool supports_descriptor_buffer = false;
+	bool supports_amd_buffer_marker = false;
+	bool supports_nv_checkpoints = false;
+	bool supports_post_mortem = false;
+
+	bool supports_descriptor_buffer_or_heap = false;
+	uint32_t resource_heap_offset_alignment = 0;
+	uint32_t resource_heap_resource_desc_size = 0;
+	uint32_t resource_heap_resource_desc_size_log2 = 0;
 
 	VkPhysicalDeviceFeatures enabled_features = {};
 
 	VkPhysicalDeviceVulkan11Features vk11_features = {};
 	VkPhysicalDeviceVulkan12Features vk12_features = {};
 	VkPhysicalDeviceVulkan13Features vk13_features = {};
+	VkPhysicalDeviceVulkan14Features vk14_features = {};
 	VkPhysicalDeviceVulkan11Properties vk11_props = {};
 	VkPhysicalDeviceVulkan12Properties vk12_props = {};
 	VkPhysicalDeviceVulkan13Properties vk13_props = {};
+	VkPhysicalDeviceVulkan14Properties vk14_props = {};
 
 	// KHR
+	VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivative_features = {};
 	VkPhysicalDevicePerformanceQueryFeaturesKHR performance_query_features = {};
 	VkPhysicalDevicePresentIdFeaturesKHR present_id_features = {};
+	VkPhysicalDevicePresentId2FeaturesKHR present_id2_features = {};
 	VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features = {};
+	VkPhysicalDevicePresentWait2FeaturesKHR present_wait2_features = {};
 	VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric_features = {};
 	VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance1_features = {};
+	VkPhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features = {};
+	VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary_properties = {};
+	VkDevicePipelineBinaryInternalCacheControlKHR pipeline_binary_internal_cache_control = {};
+	VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_features = {};
+	VkPhysicalDeviceVideoEncodeAV1FeaturesKHR av1_features = {};
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR rtas_features = {};
+	VkPhysicalDeviceAccelerationStructurePropertiesKHR rtas_properties = {};
+	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
+	VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untyped_pointers_features = {};
+	VkPhysicalDeviceFaultFeaturesKHR fault_features = {};
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features = {};
+	VkPhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR intra_refresh_features = {};
+	VkPhysicalDeviceShaderAbortFeaturesKHR shader_abort_features = {};
+	VkPhysicalDeviceShaderConstantDataFeaturesKHR shader_constant_data_features = {};
 
 	// EXT
 	VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory_properties = {};
 	VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative_rasterization_properties = {};
 	VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features = {};
 	VkPhysicalDeviceASTCDecodeFeaturesEXT astc_decode_features = {};
-	VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_maintenance1_features = {};
+	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance1_features = {};
 	VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_device_local_memory_features = {};
 	VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features = {};
 	VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties = {};
@@ -103,13 +134,21 @@ struct DeviceFeatures
 	VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT rgba10x6_formats_features = {};
 	VkPhysicalDeviceImageCompressionControlFeaturesEXT image_compression_control_features = {};
 	VkPhysicalDeviceImageCompressionControlSwapchainFeaturesEXT image_compression_control_swapchain_features = {};
+	VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT device_generated_commands_features = {};
+	VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT device_generated_commands_properties = {};
+	VkPhysicalDeviceRobustness2FeaturesEXT robustness2_features = {};
+	VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer_features = {};
+	VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_properties = {};
+	VkPhysicalDevicePresentTimingFeaturesEXT present_timing_features = {};
+	VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptor_heap_features = {};
+	VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptor_heap_properties = {};
+	VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64_features = {};
 
 	// Vendor
-	VkPhysicalDeviceComputeShaderDerivativesFeaturesNV compute_shader_derivative_features = {};
-	VkPhysicalDeviceDeviceGeneratedCommandsFeaturesNV device_generated_commands_features = {};
-	VkPhysicalDeviceDeviceGeneratedCommandsComputeFeaturesNV device_generated_commands_compute_features = {};
-	VkPhysicalDeviceDeviceGeneratedCommandsPropertiesNV device_generated_commands_properties = {};
 	VkPhysicalDeviceDescriptorPoolOverallocationFeaturesNV descriptor_pool_overallocation_features = {};
+	VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_features = {};
+	VkPhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory_features = {};
+	VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE shader_mixed_float_dot_product_features = {};
 
 	// Fallback feature structs (Vulkan 1.1)
 	VkPhysicalDeviceHostQueryResetFeatures host_query_reset_features = {};
@@ -119,6 +158,7 @@ struct DeviceFeatures
 	VkPhysicalDevice8BitStorageFeaturesKHR storage_8bit_features = {};
 	// Fallback feature structs (Vulkan 1.3)
 	VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_size_control_features = {};
+	VkPhysicalDeviceSynchronization2Features sync2_features = {};
 
 	VkDriverId driver_id = {};
 
@@ -148,7 +188,15 @@ enum ContextCreationFlagBits
 	CONTEXT_CREATION_ENABLE_VIDEO_DECODE_BIT = 1 << 1,
 	CONTEXT_CREATION_ENABLE_VIDEO_ENCODE_BIT = 1 << 2,
 	CONTEXT_CREATION_ENABLE_VIDEO_H264_BIT = 1 << 3,
-	CONTEXT_CREATION_ENABLE_VIDEO_H265_BIT = 1 << 4
+	CONTEXT_CREATION_ENABLE_VIDEO_H265_BIT = 1 << 4,
+	CONTEXT_CREATION_ENABLE_PIPELINE_BINARY_BIT = 1 << 5,
+	CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT = 1 << 6,
+	CONTEXT_CREATION_ENABLE_ROBUSTNESS_2_BIT = 1 << 7,
+	CONTEXT_CREATION_ENABLE_VIDEO_AV1_BIT = 1 << 8,
+	CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT = 1 << 9,
+	CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT = 1 << 10,
+	CONTEXT_CREATION_ENABLE_POST_MORTEM_BIT = 1 << 11,
+	CONTEXT_CREATION_ENABLE_VIDEO_FEATURE_ONLY_BIT = 1 << 12,
 };
 using ContextCreationFlags = uint32_t;
 
@@ -165,12 +213,22 @@ struct InstanceFactory
 {
 	virtual ~InstanceFactory() = default;
 	virtual VkInstance create_instance(const VkInstanceCreateInfo *info) = 0;
+
+	// Lifetime of any data in create info must remain as long as Context is alive.
+	virtual const VkInstanceCreateInfo *get_existing_create_info();
+	virtual bool factory_owns_created_instance();
 };
 
 struct DeviceFactory
 {
 	virtual ~DeviceFactory() = default;
 	virtual VkDevice create_device(VkPhysicalDevice gpu, const VkDeviceCreateInfo *info) = 0;
+
+	// Lifetime of any data in create info must remain as long as Context is alive.
+	// If pNext is not NULL, the first link in the pNext chain must be VkPhysicalDeviceFeatures2.
+	virtual const VkDeviceCreateInfo *get_existing_create_info();
+	virtual bool factory_owns_created_device();
+	virtual VkQueue get_queue(uint32_t family_index, uint32_t index);
 };
 
 class CopiedApplicationInfo
@@ -212,7 +270,7 @@ public:
 
 	// Call before initializing instances. app_info may be freed after returning.
 	// API_VERSION must be at least 1.1.
-	// By default, a Vulkan 1.1 instance is created.
+	// By default, a Vulkan 1.1 to 1.4 instance is created depending on support.
 	void set_application_info(const VkApplicationInfo *app_info);
 
 	// Recommended interface.
@@ -389,6 +447,7 @@ private:
 	Fossilize::FeatureFilter feature_filter;
 	bool format_is_supported(VkFormat format, VkFormatFeatureFlags features) override;
 	bool descriptor_set_layout_is_supported(const VkDescriptorSetLayoutCreateInfo *set_layout) override;
+	void physical_device_feature_query(VkPhysicalDeviceFeatures2 *pdf2) override;
 #endif
 
 	bool init_profile();

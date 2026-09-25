@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -39,6 +39,8 @@ enum class BufferDomain
 	CachedHost,
 	CachedCoherentHostPreferCoherent, // Aim for both cached and coherent, but prefer COHERENT
 	CachedCoherentHostPreferCached, // Aim for both cached and coherent, but prefer CACHED
+	UMACachedCoherentPreferDevice, // Aim for DEVICE | CACHED | COHERENT, but fallback to plain DEVICE if not supported.
+	DebugReadback // DEVICE_COHERENT + HOST_COHERENT. For AMD_buffer_marker and other breadcrumbs.
 };
 
 enum BufferMiscFlagBits
@@ -53,7 +55,7 @@ struct BufferCreateInfo
 {
 	BufferDomain domain = BufferDomain::Device;
 	VkDeviceSize size = 0;
-	VkBufferUsageFlags usage = 0;
+	VkBufferUsageFlags2 usage = 0;
 	BufferMiscFlags misc = 0;
 	VkMemoryRequirements allocation_requirements = {};
 	ExternalHandle external;
@@ -107,6 +109,11 @@ public:
 		return bda;
 	}
 
+	void disown_buffer()
+	{
+		owns_buffer = false;
+	}
+
 private:
 	friend class Util::ObjectPool<Buffer>;
 	Buffer(Device *device, VkBuffer buffer, const DeviceAllocation &alloc, const BufferCreateInfo &info,
@@ -117,6 +124,7 @@ private:
 	DeviceAllocation alloc;
 	BufferCreateInfo info;
 	VkDeviceAddress bda;
+	bool owns_buffer = true;
 };
 using BufferHandle = Util::IntrusivePtr<Buffer>;
 
@@ -137,7 +145,20 @@ public:
 
 	VkBufferView get_view() const
 	{
-		return view;
+		VK_ASSERT(view.view);
+		return view.view;
+	}
+
+	const CachedDescriptorPayload &get_uniform_payload() const
+	{
+		VK_ASSERT(view.uniform.ptr && view.uniform.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
+		return view.uniform;
+	}
+
+	const CachedDescriptorPayload &get_storage_payload() const
+	{
+		VK_ASSERT(view.storage.ptr && view.storage.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
+		return view.storage;
 	}
 
 	const BufferViewCreateInfo &get_create_info()
@@ -152,10 +173,10 @@ public:
 
 private:
 	friend class Util::ObjectPool<BufferView>;
-	BufferView(Device *device, VkBufferView view, const BufferViewCreateInfo &info);
+	BufferView(Device *device, const CachedBufferView &view, const BufferViewCreateInfo &info);
 
 	Device *device;
-	VkBufferView view;
+	CachedBufferView view;
 	BufferViewCreateInfo info;
 };
 using BufferViewHandle = Util::IntrusivePtr<BufferView>;

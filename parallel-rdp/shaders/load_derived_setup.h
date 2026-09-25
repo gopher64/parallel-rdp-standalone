@@ -43,7 +43,8 @@ DerivedSetup load_derived_setup(uint index)
 			u16(derived_setup.elems[index].dz),
 			u8(derived_setup.elems[index].dz_compressed),
 			u8(derived_setup.elems[index].min_lod),
-			i16x4(derived_setup.elems[index].factors));
+			i16x4(derived_setup.elems[index].factors),
+			u16x4(derived_setup.elems[index].key_width));
 #endif
 }
 

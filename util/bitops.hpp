@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -36,6 +36,7 @@ namespace Util
 #define trailing_zeroes64_(x) ((x) == 0 ? 64 : __builtin_ctzll(x))
 #define trailing_ones64_(x) __builtin_ctzll(~uint64_t(x))
 #define popcount32_(x) __builtin_popcount(x)
+#define popcount64_(x) __builtin_popcountll(x)
 
 static inline uint32_t leading_zeroes(uint32_t x) { return leading_zeroes_(x); }
 static inline uint32_t trailing_zeroes(uint32_t x) { return trailing_zeroes_(x); }
@@ -44,6 +45,7 @@ static inline uint32_t leading_zeroes64(uint64_t x) { return leading_zeroes64_(x
 static inline uint32_t trailing_zeroes64(uint64_t x) { return trailing_zeroes64_(x); }
 static inline uint32_t trailing_ones64(uint64_t x) { return trailing_ones64_(x); }
 static inline uint32_t popcount32(uint32_t x) { return popcount32_(x); }
+static inline uint32_t popcount64(uint64_t x) { return popcount64_(x); }
 
 #elif defined(_MSC_VER)
 namespace Internal
@@ -51,6 +53,15 @@ namespace Internal
 static inline uint32_t popcount32(uint32_t x)
 {
 	return __popcnt(x);
+}
+
+static inline uint32_t popcount64(uint64_t x)
+{
+#ifdef _WIN64
+	return __popcnt64(x);
+#else
+	return popcount32(uint32_t(x)) + popcount32(uint32_t(x >> 32));
+#endif
 }
 
 static inline uint32_t clz(uint32_t x)
@@ -73,20 +84,34 @@ static inline uint32_t ctz(uint32_t x)
 
 static inline uint32_t clz64(uint64_t x)
 {
+#ifdef _WIN64
 	unsigned long result;
 	if (_BitScanReverse64(&result, x))
 		return 63 - result;
 	else
 		return 64;
+#else
+	if (x > UINT32_MAX)
+		return clz(uint32_t(x >> 32));
+	else
+		return clz(uint32_t(x)) + 32;
+#endif
 }
 
 static inline uint32_t ctz64(uint64_t x)
 {
+#ifdef _WIN64
 	unsigned long result;
 	if (_BitScanForward64(&result, x))
 		return result;
 	else
 		return 64;
+#else
+	if ((x & UINT32_MAX) != 0)
+		return ctz(uint32_t(x));
+	else
+		return ctz(uint32_t(x >> 32)) + 32;
+#endif
 }
 }
 
@@ -97,6 +122,7 @@ static inline uint32_t leading_zeroes64(uint64_t x) { return Internal::clz64(x);
 static inline uint32_t trailing_zeroes64(uint64_t x) { return Internal::ctz64(x); }
 static inline uint32_t trailing_ones64(uint64_t x) { return Internal::ctz64(~x); }
 static inline uint32_t popcount32(uint32_t x) { return Internal::popcount32(x); }
+static inline uint32_t popcount64(uint64_t x) { return Internal::popcount64(x); }
 #else
 #error "Implement me."
 #endif

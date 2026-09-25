@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -92,20 +92,50 @@ struct ExternalHandle
 	{
 		VK_ASSERT(type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
 		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT ||
 		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT ||
+		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT ||
 		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT ||
-		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT);
-		return type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT ||
+		          type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+
+		return type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+		       type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT &&
+		       type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT &&
+		       type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 	}
 
 	static bool semaphore_handle_type_imports_by_reference(VkExternalSemaphoreHandleTypeFlagBits type)
 	{
 		VK_ASSERT(type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT ||
 		          type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
-		          type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT);
+		          type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT ||
+		          type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT ||
+		          type == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
 
 		// D3D11 fence aliases D3D12 fence. It's basically the same thing, just D3D11.3.
-		return type != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+		return type != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT &&
+		       type != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT &&
+		       type != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
 	}
+};
+
+template <typename T>
+static inline const T *find_pnext(const void *pnext, VkStructureType sType)
+{
+	auto *chain = static_cast<const VkBaseInStructure *>(pnext);
+	while (chain)
+	{
+		if (chain->sType == sType)
+			break;
+		chain = static_cast<const VkBaseInStructure *>(chain->pNext);
+	}
+	return reinterpret_cast<const T *>(chain);
+}
+
+struct BufferMarkerHandle
+{
+	enum : uint32_t { Invalid = UINT32_MAX };
+	uint32_t index = Invalid;
 };
 }

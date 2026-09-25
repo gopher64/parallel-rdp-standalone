@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -79,6 +79,7 @@ enum ImageMiscFlagBits
 	IMAGE_MISC_CONCURRENT_QUEUE_VIDEO_DUPLEX =
 		IMAGE_MISC_CONCURRENT_QUEUE_VIDEO_DECODE_BIT |
 		IMAGE_MISC_CONCURRENT_QUEUE_VIDEO_ENCODE_BIT,
+	IMAGE_MISC_CREATE_PER_MIP_LEVEL_VIEWS_BIT = 1 << 14
 };
 using ImageMiscFlags = uint32_t;
 
@@ -121,69 +122,76 @@ class ImageView : public Util::IntrusivePtrEnabled<ImageView, ImageViewDeleter, 
 public:
 	friend struct ImageViewDeleter;
 
-	ImageView(Device *device, VkImageView view, const ImageViewCreateInfo &info);
+	ImageView(Device *device, const CachedImageView &view, const ImageViewCreateInfo &info);
 
 	~ImageView();
 
-	void set_alt_views(VkImageView depth, VkImageView stencil)
+	void set_separate_depth_stencil_views(const CachedImageView &depth, const CachedImageView &stencil)
 	{
-		VK_ASSERT(depth_view == VK_NULL_HANDLE);
-		VK_ASSERT(stencil_view == VK_NULL_HANDLE);
+		VK_ASSERT(depth_view.view == VK_NULL_HANDLE);
+		VK_ASSERT(stencil_view.view == VK_NULL_HANDLE);
 		depth_view = depth;
 		stencil_view = stencil;
 	}
 
-	void set_render_target_views(std::vector<VkImageView> views)
+	void set_render_target_views(std::vector<CachedImageView> views)
 	{
 		VK_ASSERT(render_target_views.empty());
 		render_target_views = std::move(views);
 	}
 
-	void set_unorm_view(VkImageView view_)
+	void set_mip_views(std::vector<CachedImageView> views)
 	{
-		VK_ASSERT(unorm_view == VK_NULL_HANDLE);
+		VK_ASSERT(mip_views.empty());
+		mip_views = std::move(views);
+	}
+
+	void set_unorm_view(const CachedImageView &view_)
+	{
+		VK_ASSERT(unorm_view.view == VK_NULL_HANDLE);
 		unorm_view = view_;
 	}
 
-	void set_srgb_view(VkImageView view_)
+	void set_srgb_view(const CachedImageView &view_)
 	{
-		VK_ASSERT(srgb_view == VK_NULL_HANDLE);
+		VK_ASSERT(srgb_view.view == VK_NULL_HANDLE);
 		srgb_view = view_;
 	}
 
 	// By default, gets a combined view which includes all aspects in the image.
 	// This would be used mostly for render targets.
-	VkImageView get_view() const
+	const CachedImageView &get_view() const
 	{
 		return view;
 	}
 
-	VkImageView get_render_target_view(unsigned layer) const;
+	const CachedImageView &get_render_target_view(unsigned layer) const;
+	const CachedImageView &get_mip_view(unsigned level) const;
 
 	// Gets an image view which only includes floating point domains.
 	// Takes effect when we want to sample from an image which is Depth/Stencil,
 	// but we only want to sample depth.
-	VkImageView get_float_view() const
+	const CachedImageView &get_float_view() const
 	{
-		return depth_view != VK_NULL_HANDLE ? depth_view : view;
+		return depth_view.view != VK_NULL_HANDLE ? depth_view : view;
 	}
 
 	// Gets an image view which only includes integer domains.
 	// Takes effect when we want to sample from an image which is Depth/Stencil,
 	// but we only want to sample stencil.
-	VkImageView get_integer_view() const
+	const CachedImageView &get_integer_view() const
 	{
-		return stencil_view != VK_NULL_HANDLE ? stencil_view : view;
+		return stencil_view.view != VK_NULL_HANDLE ? stencil_view : view;
 	}
 
-	VkImageView get_unorm_view() const
+	const CachedImageView &get_unorm_view() const
 	{
-		return unorm_view;
+		return unorm_view.view != VK_NULL_HANDLE ? unorm_view : view;
 	}
 
-	VkImageView get_srgb_view() const
+	const CachedImageView &get_srgb_view() const
 	{
-		return srgb_view;
+		return srgb_view.view != VK_NULL_HANDLE ? srgb_view : view;
 	}
 
 	VkFormat get_format() const
@@ -207,13 +215,16 @@ public:
 
 private:
 	Device *device;
-	VkImageView view;
-	std::vector<VkImageView> render_target_views;
-	VkImageView depth_view = VK_NULL_HANDLE;
-	VkImageView stencil_view = VK_NULL_HANDLE;
-	VkImageView unorm_view = VK_NULL_HANDLE;
-	VkImageView srgb_view = VK_NULL_HANDLE;
+	CachedImageView view = {};
+	std::vector<CachedImageView> render_target_views;
+	std::vector<CachedImageView> mip_views;
+	CachedImageView depth_view = {};
+	CachedImageView stencil_view = {};
+	CachedImageView unorm_view = {};
+	CachedImageView srgb_view = {};
 	ImageViewCreateInfo info;
+
+	void free_cached_view(CachedImageView &cached);
 };
 
 using ImageViewHandle = Util::IntrusivePtr<ImageView>;
@@ -223,7 +234,15 @@ enum class ImageDomain
 	Physical,
 	Transient,
 	LinearHostCached,
-	LinearHost
+	LinearHost,
+	LinearDevice,
+	HostCopy
+};
+
+enum class ImageLayout
+{
+	Optimal,
+	General
 };
 
 struct ImageCreateInfo
@@ -249,6 +268,7 @@ struct ImageCreateInfo
 	const ImmutableYcbcrConversion *ycbcr_conversion = nullptr;
 	void *pnext = nullptr;
 	ExternalHandle external;
+	ImageLayout layout = ImageLayout::Optimal;
 
 	static ImageCreateInfo immutable_image(const TextureFormatLayout &layout)
 	{
@@ -261,7 +281,7 @@ struct ImageCreateInfo
 		info.layers = layout.get_layers();
 		info.levels = layout.get_levels();
 		info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-		info.initial_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		info.initial_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
 		info.samples = VK_SAMPLE_COUNT_1_BIT;
 		info.domain = ImageDomain::Physical;
 		return info;
@@ -281,7 +301,7 @@ struct ImageCreateInfo
 		info.samples = VK_SAMPLE_COUNT_1_BIT;
 		info.flags = 0;
 		info.misc = mipmapped ? unsigned(IMAGE_MISC_GENERATE_MIPS_BIT) : 0u;
-		info.initial_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		info.initial_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
 		return info;
 	}
 
@@ -311,9 +331,7 @@ struct ImageCreateInfo
 		info.samples = VK_SAMPLE_COUNT_1_BIT;
 		info.flags = 0;
 		info.misc = 0;
-		info.initial_layout = format_has_depth_or_stencil_aspect(format) ?
-		                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
-		                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		info.initial_layout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
 		return info;
 	}
 
@@ -376,12 +394,6 @@ struct ImageDeleter
 	void operator()(Image *image);
 };
 
-enum class Layout
-{
-	Optimal,
-	General
-};
-
 class Image : public Util::IntrusivePtrEnabled<Image, ImageDeleter, HandleCounter>,
               public Cookie, public InternalSyncEnabled
 {
@@ -438,17 +450,7 @@ public:
 
 	VkImageLayout get_layout(VkImageLayout optimal) const
 	{
-		return layout_type == Layout::Optimal ? optimal : VK_IMAGE_LAYOUT_GENERAL;
-	}
-
-	Layout get_layout_type() const
-	{
-		return layout_type;
-	}
-
-	void set_layout(Layout layout)
-	{
-		layout_type = layout;
+		return create_info.layout == ImageLayout::Optimal ? optimal : VK_IMAGE_LAYOUT_GENERAL;
 	}
 
 	bool is_swapchain_image() const
@@ -504,7 +506,7 @@ public:
 private:
 	friend class Util::ObjectPool<Image>;
 
-	Image(Device *device, VkImage image, VkImageView default_view, const DeviceAllocation &alloc,
+	Image(Device *device, VkImage image, const CachedImageView &default_view, const DeviceAllocation &alloc,
 	      const ImageCreateInfo &info, VkImageViewType view_type);
 
 	Device *device;
@@ -513,7 +515,6 @@ private:
 	DeviceAllocation alloc;
 	ImageCreateInfo create_info;
 
-	Layout layout_type = Layout::Optimal;
 	VkImageLayout swapchain_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	VkSurfaceTransformFlagBitsKHR surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	bool owns_image = true;

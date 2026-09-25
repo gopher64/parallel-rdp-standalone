@@ -24,7 +24,7 @@
 #define SHADING_H_
 
 #ifdef RASTERIZER_SPEC_CONSTANT
-const int SCALING_LOG2 = (STATIC_STATE_FLAGS >> RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET) & 3;
+const int SCALING_LOG2 = int((uint(STATIC_STATE_FLAGS) >> uint(RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET)) & 3u);
 const int SCALING_FACTOR = 1 << SCALING_LOG2;
 #endif
 
@@ -123,6 +123,7 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 	bool convert_one = (static_state_flags & RASTERIZATION_CONVERT_ONE_BIT) != 0;
 	bool bilerp0 = (static_state_flags & RASTERIZATION_BILERP_0_BIT) != 0;
 	bool bilerp1 = (static_state_flags & RASTERIZATION_BILERP_1_BIT) != 0;
+	bool key_en = (static_state_flags & RASTERIZATION_KEY_ENABLE_BIT) != 0u;
 
 	if ((static_state_flags & RASTERIZATION_NEED_NOISE_BIT) != 0)
 		reseed_noise(x, y, primitive_index + global_constants.fb_info.base_primitive_index);
@@ -317,7 +318,8 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 		combined = u8x4(combiner_cycle1(combined_inputs,
 		                                combiner_inputs_rgb1,
 		                                combiner_inputs_alpha1,
-		                                alpha_dith, coverage_count, cvg_times_alpha, alpha_cvg_select));
+		                                alpha_dith, coverage_count, cvg_times_alpha, alpha_cvg_select,
+		                                key_en, derived.key_width));
 	}
 	else
 	{
@@ -328,7 +330,8 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 		combined = u8x4(combiner_cycle1(combined_inputs,
 		                                combiner_inputs_rgb1,
 		                                combiner_inputs_alpha1,
-		                                alpha_dith, coverage_count, cvg_times_alpha, alpha_cvg_select));
+		                                alpha_dith, coverage_count, cvg_times_alpha, alpha_cvg_select,
+		                                key_en, derived.key_width));
 
 		alpha_reference = combined.a;
 	}

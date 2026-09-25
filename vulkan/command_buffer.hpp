@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -23,6 +23,7 @@
 #pragma once
 
 #include "buffer.hpp"
+#include "rtas.hpp"
 #include "buffer_pool.hpp"
 #include "vulkan_headers.hpp"
 #include "image.hpp"
@@ -180,7 +181,9 @@ union PipelineState {
 		uint32_t subgroup_minimum_size_log2_task : 3;
 		uint32_t subgroup_maximum_size_log2_task : 3;
 		uint32_t conservative_raster : 1;
-		uint32_t padding : 9;
+		uint32_t indirect_bindable : 1;
+		uint32_t robustness : 1;
+		uint32_t padding : 7;
 
 		// Word 3
 		uint32_t write_mask;
@@ -258,7 +261,6 @@ struct DeferredPipelineCompile
 {
 	Program *program;
 	const PipelineLayout *layout;
-	std::vector<Program *> program_group;
 
 	const RenderPass *compatible_render_pass;
 	PipelineState static_state;
@@ -303,6 +305,7 @@ public:
 	void begin_region(const char *name, const float *color = nullptr);
 	void insert_label(const char *name, const float *color = nullptr);
 	void end_region();
+	void checkpoint(const char *tag);
 
 	Device &get_device()
 	{
@@ -325,19 +328,29 @@ public:
 		thread_index = index_;
 	}
 
+	void set_borrowed()
+	{
+		borrowed = true;
+	}
+
+	bool is_borrowed() const
+	{
+		return borrowed;
+	}
+
 	unsigned get_thread_index() const
 	{
 		return thread_index;
 	}
 
-	void set_is_secondary()
-	{
-		is_secondary = true;
-	}
-
 	bool get_is_secondary() const
 	{
 		return is_secondary;
+	}
+
+	void set_breadcrumbs_handle(BufferMarkerHandle handle)
+	{
+		breadcrumbs = handle;
 	}
 
 	void clear_image(const Image &image, const VkClearValue &value);
@@ -368,6 +381,9 @@ public:
 	void copy_image_to_buffer(const Buffer &dst, const Image &src, VkDeviceSize buffer_offset, const VkOffset3D &offset,
 	                          const VkExtent3D &extent, unsigned row_length, unsigned slice_height,
 	                          const VkImageSubresourceLayers &subresrouce);
+
+	void begin_barrier_batch();
+	void end_barrier_batch();
 
 	void full_barrier();
 	void pixel_barrier();
@@ -437,7 +453,21 @@ public:
 	                                                                          const RenderPassInfo &rp, unsigned thread_index, unsigned subpass);
 
 	void set_program(Program *program);
-	void set_program_group(Program * const *programs, unsigned num_programs, const PipelineLayout *layout);
+
+	// Pipeline state must not change between calling this and dispatching.
+	// Ideally it's called right before execute indirect commands.
+	// The execution set handle is only valid as long as the creating command buffer is alive.
+
+	struct ExecutionSetSpecializationConstants
+	{
+		uint32_t mask;
+		uint32_t constants[VULKAN_NUM_USER_SPEC_CONSTANTS];
+	};
+
+	VkIndirectExecutionSetEXT bake_and_set_program_group(
+			Program * const *programs, unsigned num_programs,
+			const ExecutionSetSpecializationConstants *spec_constants,
+			const PipelineLayout *layout);
 
 #ifdef GRANITE_VULKAN_SYSTEM_HANDLES
 	// Convenience functions for one-off shader binds.
@@ -458,6 +488,7 @@ public:
 	void set_texture(unsigned set, unsigned binding, const ImageView &view, const Sampler &sampler);
 	void set_texture(unsigned set, unsigned binding, const ImageView &view, StockSampler sampler);
 	void set_storage_texture(unsigned set, unsigned binding, const ImageView &view);
+	void set_storage_texture_level(unsigned set, unsigned binding, const ImageView &view, unsigned level);
 	void set_unorm_storage_texture(unsigned set, unsigned binding, const ImageView &view);
 	void set_sampler(unsigned set, unsigned binding, const Sampler &sampler);
 	void set_sampler(unsigned set, unsigned binding, StockSampler sampler);
@@ -467,8 +498,9 @@ public:
 	void set_storage_buffer(unsigned set, unsigned binding, const Buffer &buffer);
 	void set_storage_buffer(unsigned set, unsigned binding, const Buffer &buffer, VkDeviceSize offset,
 	                        VkDeviceSize range);
+	void set_rtas(unsigned set, unsigned binding, const RTAS &rtas);
 
-	void set_bindless(unsigned set, VkDescriptorSet desc_set);
+	void set_bindless(unsigned set, const BindlessDescriptorSet &handle);
 
 	void push_constants(const void *data, VkDeviceSize offset, VkDeviceSize range);
 
@@ -485,6 +517,8 @@ public:
 	void *allocate_index_data(VkDeviceSize size, VkIndexType index_type);
 
 	void *update_buffer(const Buffer &buffer, VkDeviceSize offset, VkDeviceSize size);
+	void update_buffer_inline(const Buffer &buffer, VkDeviceSize offset, VkDeviceSize size,
+	                          const void *data);
 	void *update_image(const Image &image, const VkOffset3D &offset, const VkExtent3D &extent, uint32_t row_length,
 	                   uint32_t image_height, const VkImageSubresourceLayers &subresource);
 	void *update_image(const Image &image, uint32_t row_length = 0, uint32_t image_height = 0);
@@ -517,10 +551,19 @@ public:
 	void draw_mesh_tasks_indirect(const Buffer &buffer, VkDeviceSize offset, uint32_t draw_count, uint32_t stride);
 	void draw_mesh_tasks_multi_indirect(const Buffer &buffer, VkDeviceSize offset, uint32_t draw_count, uint32_t stride,
 										const Buffer &count, VkDeviceSize count_offset);
-	void execute_indirect_commands(const IndirectLayout *indirect_layout,
+	void execute_indirect_commands(VkIndirectExecutionSetEXT execution_set,
+	                               const IndirectLayout *indirect_layout,
 	                               uint32_t sequences,
 	                               const Buffer &indirect, VkDeviceSize offset,
-	                               const Buffer *count, size_t count_offset);
+	                               const Buffer *count, size_t count_offset,
+	                               CommandBuffer &preprocess);
+
+	void begin_rtas_batch();
+	void build_rtas(BuildMode mode, const RTAS &rtas, const BottomRTASCreateInfo &info);
+	void build_rtas(BuildMode mode, const RTAS &rtas, const TopRTASCreateInfo &info);
+	void write_compacted_rtas_size(const RTAS &rtas, const QueryPoolResult &query);
+	void compact_rtas(const RTAS &dst, const RTAS &src);
+	void end_rtas_batch();
 
 	void set_opaque_state();
 	void set_quad_state();
@@ -677,6 +720,11 @@ public:
 		SET_POTENTIALLY_STATIC_STATE(spec_constant_mask);
 	}
 
+	inline void set_robustness(bool robustness)
+	{
+		SET_STATIC_STATE(robustness);
+	}
+
 	template <typename T>
 	inline void set_specialization_constant(unsigned index, const T &value)
 	{
@@ -808,8 +856,7 @@ public:
 	{
 		Sync,
 		FailOnCompileRequired,
-		AsyncThread,
-		IndirectBindable
+		AsyncThread
 	};
 	static Pipeline build_graphics_pipeline(Device *device, const DeferredPipelineCompile &compile, CompileMode mode);
 	static Pipeline build_compute_pipeline(Device *device, const DeferredPipelineCompile &compile, CompileMode mode);
@@ -820,12 +867,13 @@ public:
 
 private:
 	friend class Util::ObjectPool<CommandBuffer>;
-	CommandBuffer(Device *device, VkCommandBuffer cmd, VkPipelineCache cache, Type type);
+	CommandBuffer(Device *device, VkCommandBuffer cmd, VkPipelineCache cache, Type type, bool secondary);
 
 	Device *device;
 	const VolkDeviceTable &table;
 	VkCommandBuffer cmd;
 	Type type;
+	BufferMarkerHandle breadcrumbs;
 
 	const Framebuffer *framebuffer = nullptr;
 	const RenderPass *actual_render_pass = nullptr;
@@ -841,6 +889,7 @@ private:
 	VkPipelineLayout current_pipeline_layout = VK_NULL_HANDLE;
 	VkSubpassContents current_contents = VK_SUBPASS_CONTENTS_INLINE;
 	unsigned thread_index = 0;
+	bool borrowed = false;
 
 	VkViewport viewport = {};
 	VkRect2D scissor = {};
@@ -885,17 +934,26 @@ private:
 	void begin_graphics();
 	void flush_descriptor_set(
 		uint32_t set, VkDescriptorSet *sets,
-		uint32_t &first_set, uint32_t &set_count,
-		uint32_t *dynamic_offsets, uint32_t &num_dynamic_offsets);
+		uint32_t &first_set, uint32_t &set_count);
 	void push_descriptor_set(uint32_t set);
 	void rebind_descriptor_set(
 		uint32_t set, VkDescriptorSet *sets,
-		uint32_t &first_set, uint32_t &set_count,
-		uint32_t *dynamic_offsets, uint32_t &num_dynamic_offsets);
+		uint32_t &first_set, uint32_t &set_count);
 	void flush_descriptor_binds(const VkDescriptorSet *sets,
-		uint32_t &first_set, uint32_t &set_count,
-		uint32_t *dynamic_offsets, uint32_t &num_dynamic_offsets);
+		uint32_t &first_set, uint32_t &set_count);
+	void rebind_descriptor_offset(uint32_t set, uint32_t &first_set, uint32_t &set_count);
+	void allocate_descriptor_offset(uint32_t set, uint32_t &first_set, uint32_t &set_count);
+	void flush_descriptor_offsets(uint32_t &first_set, uint32_t &set_count);
 	void validate_descriptor_binds(uint32_t set);
+	void allocate_descriptor_heap_set(uint32_t set);
+	void rebind_descriptor_heap_set(uint32_t set);
+
+	struct DescriptorSlice
+	{
+		uint8_t *mapped;
+		VkDeviceSize offset;
+	};
+	DescriptorSlice allocate_descriptor_slice(VkDeviceSize size, VkDeviceSize alignment);
 
 	void begin_compute();
 	void begin_context();
@@ -905,10 +963,18 @@ private:
 	BufferBlock ubo_block;
 	BufferBlock staging_block;
 
-	void set_texture(unsigned set, unsigned binding, VkImageView float_view, VkImageView integer_view,
-	                 VkImageLayout layout,
+	DescriptorBufferAllocation desc_buffer = {};
+	VkDeviceSize desc_buffer_alloc_offset = 0;
+	VkDeviceSize desc_buffer_heap_cached_offsets[VULKAN_NUM_DESCRIPTOR_SETS];
+	VkDeviceAddress desc_heap_cached_table[VULKAN_NUM_DESCRIPTOR_SETS];
+	bool desc_buffer_enable = false;
+	bool desc_heap_enable = false;
+
+	void set_texture(unsigned set, unsigned binding,
+	                 VkImageView float_view, VkImageView integer_view, VkImageLayout layout,
+	                 const CachedDescriptorPayload &float_payload, const CachedDescriptorPayload &integer_payload,
 	                 uint64_t cookie);
-	void set_buffer_view_common(unsigned set, unsigned binding, const BufferView &view);
+	void set_buffer_view_common(unsigned set, unsigned binding, const BufferView &view, VkDescriptorType type);
 
 	void init_viewport_scissor(const RenderPassInfo &info, const Framebuffer *framebuffer);
 	void init_surface_transform(const RenderPassInfo &info);
@@ -921,7 +987,7 @@ private:
 
 	void bind_pipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline, uint32_t active_dynamic_state);
 
-	static void update_hash_graphics_pipeline(DeferredPipelineCompile &compile, CompileMode mode, uint32_t *active_vbos);
+	static void update_hash_graphics_pipeline(DeferredPipelineCompile &compile, uint32_t *active_vbos);
 	static void update_hash_compute_pipeline(DeferredPipelineCompile &compile);
 	void set_surface_transform_specialization_constants();
 
@@ -931,6 +997,43 @@ private:
 	                                        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT &required_info,
 	                                        VkShaderStageFlagBits stage,
 	                                        bool full_group, unsigned min_size_log2, unsigned max_size_log2);
+
+	struct
+	{
+		Util::SmallVector<VkMemoryBarrier2> memory_barriers;
+		Util::SmallVector<VkBufferMemoryBarrier2> buffer_barriers;
+		Util::SmallVector<VkImageMemoryBarrier2> image_barriers;
+		bool active = false;
+	} barrier_batch;
+
+	struct RTASBatch
+	{
+		struct Range { VkAccelerationStructureKHR dst, src; VkDeviceSize scratch; size_t start, count; };
+		struct Query { VkAccelerationStructureKHR rtas; VkQueryPool pool; uint32_t index; };
+
+		Util::SmallVector<VkAccelerationStructureGeometryKHR, 4> geometries_conv;
+		Util::SmallVector<VkAccelerationStructureBuildGeometryInfoKHR, 4> geom_info;
+		Util::SmallVector<VkAccelerationStructureBuildRangeInfoKHR, 4> range_infos;
+		Util::SmallVector<const VkAccelerationStructureBuildRangeInfoKHR *, 4> range_info_ptrs;
+
+		Util::SmallVector<BottomRTASGeometry, 4> geometries; // BLAS
+		Util::SmallVector<RTASInstance, 4> instances; // TLAS
+		Util::SmallVector<Range, 4> ranges;
+		Util::SmallVector<BuildMode, 4> build_modes;
+		Util::SmallVector<BLASMode, 4> blas_modes;
+		Util::SmallVector<Query, 4> queries;
+
+		BufferHandle scratch;
+		bool in_batch = false;
+	} rtas_batch;
+
+	void build_blas_batch();
+	void build_tlas_batch();
+	void setup_batch(VkAccelerationStructureTypeKHR rtas_type);
+	void emit_scratch_barrier();
+
+	template <typename T, typename... Ts> void checkpoint(Ts &&... ts);
+	template <typename T, typename... Ts> void checkpoint_with_signal(Ts &&... ts);
 };
 
 #ifdef GRANITE_VULKAN_SYSTEM_HANDLES

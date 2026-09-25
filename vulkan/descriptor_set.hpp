@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -32,16 +32,25 @@
 #include <utility>
 #include <vector>
 #include "cookie.hpp"
+#include "memory_allocator.hpp"
 
 namespace Vulkan
 {
 class Device;
+struct ArraySizeAccessMeta
+{
+	uint8_t array_size : 7;
+	uint8_t requires_descriptor_size : 1;
+};
+static_assert(sizeof(ArraySizeAccessMeta) == sizeof(uint8_t), "Unexpected bitfield padding.");
+
 struct DescriptorSetLayout
 {
 	uint32_t sampled_image_mask = 0;
 	uint32_t storage_image_mask = 0;
 	uint32_t uniform_buffer_mask = 0;
 	uint32_t storage_buffer_mask = 0;
+	uint32_t rtas_mask = 0;
 	uint32_t sampled_texel_buffer_mask = 0;
 	uint32_t storage_texel_buffer_mask = 0;
 	uint32_t input_attachment_mask = 0;
@@ -49,9 +58,8 @@ struct DescriptorSetLayout
 	uint32_t separate_image_mask = 0;
 	uint32_t fp_mask = 0;
 	uint32_t immutable_sampler_mask = 0;
-	uint8_t array_size[VULKAN_NUM_BINDINGS] = {};
-	uint32_t padding = 0;
-	enum { UNSIZED_ARRAY = 0xff };
+	ArraySizeAccessMeta meta[VULKAN_NUM_BINDINGS] = {};
+	enum { UNSIZED_ARRAY = 0x7f };
 };
 
 // Avoid -Wclass-memaccess warnings since we hash DescriptorSetLayout.
@@ -68,6 +76,17 @@ struct BindlessDescriptorPoolDeleter
 	void operator()(BindlessDescriptorPool *pool);
 };
 
+struct BindlessDescriptorSet
+{
+	union Handle
+	{
+		VkDescriptorSet set;
+		VkDeviceSize offset;
+	} handle = {};
+	bool valid = false;
+	explicit operator bool() const { return valid; }
+};
+
 class BindlessDescriptorPool : public Util::IntrusivePtrEnabled<BindlessDescriptorPool, BindlessDescriptorPoolDeleter, HandleCounter>,
                                public InternalSyncEnabled
 {
@@ -81,7 +100,7 @@ public:
 
 	void reset();
 	bool allocate_descriptors(unsigned count);
-	VkDescriptorSet get_descriptor_set() const;
+	BindlessDescriptorSet get_descriptor_set() const;
 
 	void push_texture(const ImageView &view);
 	void push_texture_unorm(const ImageView &view);
@@ -91,8 +110,12 @@ public:
 private:
 	Device *device;
 	DescriptorSetAllocator *allocator;
+
 	VkDescriptorPool desc_pool;
-	VkDescriptorSet desc_set = VK_NULL_HANDLE;
+	DescriptorBufferAllocation bindless_buffer;
+	VkDeviceSize bindless_buffer_offset = 0;
+
+	BindlessDescriptorSet desc_set;
 
 	uint32_t allocated_sets = 0;
 	uint32_t total_sets = 0;
@@ -100,7 +123,9 @@ private:
 	uint32_t total_descriptors = 0;
 
 	void push_texture(VkImageView view, VkImageLayout layout);
+	void push_texture(const uint8_t *ptr);
 	Util::DynamicArray<VkDescriptorImageInfo> infos;
+	Util::DynamicArray<const uint8_t *> info_ptrs;
 	uint32_t write_count = 0;
 };
 using BindlessDescriptorPoolHandle = Util::IntrusivePtr<BindlessDescriptorPool>;
@@ -140,15 +165,40 @@ public:
 		return bindless;
 	}
 
+	// Legacy descriptors.
 	VkDescriptorPool allocate_bindless_pool(unsigned num_sets, unsigned num_descriptors);
-	VkDescriptorSet allocate_bindless_set(VkDescriptorPool pool, unsigned num_descriptors);
+	BindlessDescriptorSet allocate_bindless_set(VkDescriptorPool pool, unsigned num_descriptors);
 	void reset_bindless_pool(VkDescriptorPool pool);
+
+	// Descriptor buffer integration.
+	DescriptorBufferAllocation allocate_bindless_buffer(unsigned num_sets, unsigned num_descriptors);
+
+	VkDeviceSize get_resource_heap_size() const
+	{
+		return desc_set_size;
+	}
+
+	VkDeviceSize get_variable_offset() const
+	{
+		return desc_set_variable_offset;
+	}
+
+	VkDeviceSize get_variable_size(unsigned count) const;
+
+	uint32_t get_binding_offset(uint32_t binding) const
+	{
+		return desc_offsets[binding];
+	}
 
 private:
 	Device *device;
 	const VolkDeviceTable &table;
 	VkDescriptorSetLayout set_layout_pool = VK_NULL_HANDLE;
 	VkDescriptorSetLayout set_layout_push = VK_NULL_HANDLE;
+
+	VkDeviceSize desc_set_size = 0;
+	VkDeviceSize desc_set_variable_offset = 0;
+	uint32_t desc_offsets[VULKAN_NUM_BINDINGS] = {};
 
 	struct Pool
 	{
@@ -176,7 +226,8 @@ public:
 
 	void begin();
 	unsigned push(const ImageView &view);
-	VkDescriptorSet commit(Device &device);
+
+	BindlessDescriptorSet commit(Device &device);
 
 	unsigned get_next_offset() const;
 

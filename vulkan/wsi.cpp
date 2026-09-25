@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -24,10 +24,18 @@
 #include "wsi.hpp"
 #include "environment.hpp"
 #include <algorithm>
+#include "timeline_trace_file.hpp"
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #if defined(ANDROID) && defined(HAVE_SWAPPY)
 #include "swappy/swappyVk.h"
 #endif
+
+static constexpr uint32_t PresentTimingQueueSize = 16;
 
 namespace Vulkan
 {
@@ -63,9 +71,16 @@ WSI::WSI()
 	hdr_metadata.maxFrameAverageLightLevel = 200.0f;
 }
 
+void WSI::set_present_wait_latency(uint32_t latency)
+{
+	present_frame_latency = latency;
+}
+
 void WSI::set_hdr_metadata(const VkHdrMetadataEXT &hdr)
 {
 	hdr_metadata = hdr;
+	valid_hdr_metadata = true;
+
 	if (swapchain && swapchain_surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
 	    device->get_device_features().supports_hdr_metadata)
 	{
@@ -223,6 +238,10 @@ bool WSI::init_surface_swapchain_dxgi(unsigned width, unsigned height)
 		format = { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT };
 		break;
 
+	case BackbufferFormat::scRGB:
+		format = { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT };
+		break;
+
 	default:
 		return false;
 	}
@@ -244,14 +263,11 @@ bool WSI::init_surface_swapchain_dxgi(unsigned width, unsigned height)
 	const uint32_t queue_present_support = 1u << context->get_queue_info().family_indices[QUEUE_INDEX_GRAPHICS];
 	device->set_swapchain_queue_family_support(queue_present_support);
 
-	swapchain_images.clear();
-	for (unsigned i = 0; i < num_images; i++)
-		swapchain_images.push_back(dxgi->get_vulkan_image(i));
-
+	swapchain_images = { dxgi->get_vulkan_image() };
 	device->init_swapchain(swapchain_images, swapchain_width, swapchain_height,
 	                       swapchain_surface_format.format,
 	                       swapchain_current_prerotate,
-	                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+	                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
 	platform->event_swapchain_destroyed();
 	platform->event_swapchain_created(device.get(), swapchain, swapchain_width, swapchain_height,
@@ -337,7 +353,8 @@ bool WSI::init_simple(unsigned num_thread_indices, const Context::SystemHandles 
 	return true;
 }
 
-bool WSI::init_context_from_platform(unsigned num_thread_indices, const Context::SystemHandles &system_handles)
+bool WSI::init_context_from_platform(unsigned num_thread_indices, const Context::SystemHandles &system_handles,
+                                     ContextCreationFlags enable_flags, ContextCreationFlags disable_flags)
 {
 	VK_ASSERT(platform);
 	auto instance_ext = platform->get_instance_extensions();
@@ -349,7 +366,8 @@ bool WSI::init_context_from_platform(unsigned num_thread_indices, const Context:
 			CONTEXT_CREATION_ENABLE_VIDEO_DECODE_BIT |
 			CONTEXT_CREATION_ENABLE_VIDEO_ENCODE_BIT |
 			CONTEXT_CREATION_ENABLE_VIDEO_H264_BIT |
-			CONTEXT_CREATION_ENABLE_VIDEO_H265_BIT;
+			CONTEXT_CREATION_ENABLE_VIDEO_H265_BIT |
+			CONTEXT_CREATION_ENABLE_VIDEO_AV1_BIT;
 #else
 	constexpr ContextCreationFlags video_context_flags = 0;
 #endif
@@ -358,9 +376,22 @@ bool WSI::init_context_from_platform(unsigned num_thread_indices, const Context:
 	new_context->set_num_thread_indices(num_thread_indices);
 	new_context->set_system_handles(system_handles);
 
+	ContextCreationFlags context_flags =
+			CONTEXT_CREATION_ENABLE_ADVANCED_WSI_BIT |
+			CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
+			CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT |
+			CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
+#ifdef GRANITE_VULKAN_SYSTEM_HANDLES
+			//CONTEXT_CREATION_ENABLE_PIPELINE_BINARY_BIT |
+#endif
+			video_context_flags;
+
+	context_flags |= enable_flags;
+	context_flags &= ~disable_flags;
+
 	if (!new_context->init_instance(
 			instance_ext.data(), instance_ext.size(),
-			CONTEXT_CREATION_ENABLE_ADVANCED_WSI_BIT | video_context_flags))
+			context_flags))
 	{
 		LOGE("Failed to create Vulkan instance.\n");
 		return false;
@@ -371,7 +402,7 @@ bool WSI::init_context_from_platform(unsigned num_thread_indices, const Context:
 	bool ret = new_context->init_device(
 			VK_NULL_HANDLE, tmp_surface,
 			device_ext.data(), device_ext.size(),
-			CONTEXT_CREATION_ENABLE_ADVANCED_WSI_BIT | video_context_flags);
+			context_flags);
 
 	if (tmp_surface)
 		platform->destroy_surface(new_context->get_instance(), tmp_surface);
@@ -399,16 +430,47 @@ void WSI::reinit_surface_and_swapchain(VkSurfaceKHR new_surface)
 	update_framebuffer(swapchain_width, swapchain_height);
 }
 
-void WSI::nonblock_delete_swapchains()
+VkResult WSI::wait_for_present(uint64_t id, uint64_t timeout)
 {
-	if (swapchain != VK_NULL_HANDLE && device->get_device_features().present_wait_features.presentWait)
+	if (!swapchain)
+		return VK_SUCCESS;
+
+	if (id > present_last_id)
+		return VK_NOT_READY;
+
+	bool timeout_is_fault = false;
+	if (device->get_device_features().supports_post_mortem && timeout == UINT64_MAX)
 	{
-		// If we can help it, don't try to destroy swapchains until we know the new swapchain has presented at least one frame on screen.
-		if (table->vkWaitForPresentKHR(context->get_device(), swapchain, 1, 0) != VK_SUCCESS)
-			return;
+		timeout = PostMortemTimeout;
+		timeout_is_fault = true;
 	}
 
-	Util::SmallVector<DeferredDeletion> keep;
+	VkResult vr;
+
+	if (supports_present_wait2 && device->get_device_features().present_wait2_features.presentWait2)
+	{
+		VkPresentWait2InfoKHR wait_info = { VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR };
+		wait_info.presentId = id;
+		wait_info.timeout = timeout;
+		vr = table->vkWaitForPresent2KHR(context->get_device(), swapchain, &wait_info);
+	}
+	else if (device->get_device_features().present_wait_features.presentWait)
+		vr = table->vkWaitForPresentKHR(context->get_device(), swapchain, id, timeout);
+	else
+		return VK_NOT_READY;
+
+	if (timeout_is_fault && (vr == VK_TIMEOUT || vr == VK_ERROR_DEVICE_LOST))
+		device->managers.breadcrumbs.notify_device_hung();
+	return vr;
+}
+
+void WSI::nonblock_delete_swapchain_resources()
+{
+	// If we can help it, don't try to destroy swapchains until we know the new swapchain has presented at least one frame on screen.
+	if (swapchain != VK_NULL_HANDLE && wait_for_present(1, 0) != VK_SUCCESS)
+		return;
+
+	Util::SmallVector<DeferredDeletionSwapchain> keep;
 	size_t pending = deferred_swapchains.size();
 	for (auto &swap : deferred_swapchains)
 	{
@@ -430,6 +492,11 @@ void WSI::nonblock_delete_swapchains()
 	}
 
 	deferred_swapchains = std::move(keep);
+
+	auto itr = std::remove_if(deferred_semaphore.begin(), deferred_semaphore.end(), [](DeferredDeletionSemaphore &sem) {
+		return !sem.fence || sem.fence->wait_timeout(0);
+	});
+	deferred_semaphore.erase(itr, deferred_semaphore.end());
 }
 
 void WSI::drain_swapchain(bool in_tear_down)
@@ -458,18 +525,17 @@ void WSI::drain_swapchain(bool in_tear_down)
 			}
 
 			deferred_swapchains.clear();
+			deferred_semaphore.clear();
 		}
 	}
-	else if (swapchain != VK_NULL_HANDLE && device->get_device_features().present_wait_features.presentWait && present_last_id)
+	else if (swapchain != VK_NULL_HANDLE)
 	{
-		table->vkWaitForPresentKHR(context->get_device(), swapchain, present_last_id, UINT64_MAX);
-		// If the last present was not successful,
-		// it's not clear that the present ID will be signalled, so wait idle as a fallback.
-		if (present_id != present_last_id)
-			device->wait_idle();
+		wait_for_present(present_last_id);
+
+		device->external_queue_lock();
+		table->vkDeviceWaitIdle(device->get_device());
+		device->external_queue_unlock();
 	}
-	else
-		device->wait_idle();
 }
 
 void WSI::tear_down_swapchain()
@@ -485,8 +551,9 @@ void WSI::tear_down_swapchain()
 	table->vkDestroySwapchainKHR(context->get_device(), swapchain, nullptr);
 	swapchain = VK_NULL_HANDLE;
 	has_acquired_swapchain_index = false;
-	present_id = 0;
+	next_present_id = 1;
 	present_last_id = 0;
+	device->set_present_id(VK_NULL_HANDLE, 0);
 }
 
 void WSI::deinit_surface_and_swapchain()
@@ -548,9 +615,68 @@ Semaphore WSI::consume_external_release_semaphore()
 
 void WSI::wait_swapchain_latency()
 {
-	unsigned effective_latency = low_latency_mode_enable ? 0 : present_frame_latency;
+	unsigned effective_latency = low_latency_mode_enable_present ? 0 : present_frame_latency;
 
-	if (device->get_device_features().present_wait_features.presentWait &&
+	if (device->get_device_features().supports_low_latency2_nv && swapchain && low_latency_mode_enable_gpu_submit)
+	{
+		if (!low_latency_semaphore)
+			low_latency_semaphore = device->request_semaphore(VK_SEMAPHORE_TYPE_TIMELINE);
+
+		auto wait_ts = device->write_calibrated_timestamp();
+		VkLatencySleepInfoNV sleep_info = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV };
+		sleep_info.signalSemaphore = low_latency_semaphore->get_semaphore();
+		sleep_info.value = ++low_latency_semaphore_value;
+		if (device->get_device_table().vkLatencySleepNV(device->get_device(), swapchain, &sleep_info) == VK_SUCCESS)
+			low_latency_semaphore->wait_timeline(low_latency_semaphore_value);
+		else
+			LOGE("Failed to call vkLatencySleepNV.\n");
+		device->register_time_interval("WSI", std::move(wait_ts), device->write_calibrated_timestamp(), "low_latency_sleep");
+
+		VkSetLatencyMarkerInfoNV latency_marker_info = { VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV };
+		latency_marker_info.marker = VK_LATENCY_MARKER_INPUT_SAMPLE_NV;
+		latency_marker_info.presentID = next_present_id;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+
+		latency_marker_info.marker = VK_LATENCY_MARKER_SIMULATION_START_NV;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+
+		// Avoid conflicting wait cycles when doing reflex style latency limiting.
+		effective_latency = std::max<uint32_t>(effective_latency, 2);
+	}
+	else if (device->get_device_features().anti_lag_features.antiLag)
+	{
+		auto wait_ts = device->write_calibrated_timestamp();
+
+		VkAntiLagDataAMD anti_lag = { VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD };
+		VkAntiLagPresentationInfoAMD present_info = { VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD };
+		anti_lag.pPresentationInfo = &present_info;
+		present_info.stage = VK_ANTI_LAG_STAGE_INPUT_AMD;
+		present_info.frameIndex = ++low_latency_semaphore_value;
+		anti_lag.mode = low_latency_mode_enable_gpu_submit ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+		device->get_device_table().vkAntiLagUpdateAMD(device->get_device(), &anti_lag);
+		low_latency_anti_lag_present_valid = low_latency_mode_enable_gpu_submit;
+		device->register_time_interval("WSI", std::move(wait_ts), device->write_calibrated_timestamp(),
+		                               "low_latency_sleep");
+
+		if (low_latency_mode_enable_gpu_submit)
+		{
+			// Avoid conflicting wait cycles when doing reflex style latency limiting.
+			effective_latency = std::max<uint32_t>(effective_latency, 2);
+		}
+	}
+
+	// If we're using duped frames, make sure we're waiting for the previous "real" frame,
+	// instead of a duped one.
+	// E.g. when doing frame dupes:
+	// 0,      1,    2,   3,    4,   5 ...
+	// real, dup, real, dup, real, dup ...
+	// With present frame latency of 1 (default), after presenting 2
+	// we will wait for 0 to be done rather than 1.
+	// Similarly, after presenting 3 we'll still wait for 0 to be done, so we can get on submitting work
+	// for the next real frame, 4 before the GPU drains of work.
+	effective_latency += last_duplicated_frames;
+
+	if ((device->get_device_features().present_wait_features.presentWait || supports_present_wait2) &&
 	    present_last_id > effective_latency &&
 	    current_present_mode == PresentMode::SyncToVBlank)
 	{
@@ -563,10 +689,11 @@ void WSI::wait_swapchain_latency()
 		auto begin_wait = Util::get_current_time_nsecs();
 #endif
 		auto wait_ts = device->write_calibrated_timestamp();
-		VkResult wait_result = table->vkWaitForPresentKHR(context->get_device(), swapchain, target, UINT64_MAX);
+		auto wait_result = wait_for_present(target);
+
 		device->register_time_interval("WSI", std::move(wait_ts),
 		                               device->write_calibrated_timestamp(), "wait_frame_latency");
-		if (wait_result != VK_SUCCESS)
+		if (wait_result < 0)
 			LOGE("vkWaitForPresentKHR failed, vr %d.\n", wait_result);
 #ifdef VULKAN_WSI_TIMING_DEBUG
 		auto end_wait = Util::get_current_time_nsecs();
@@ -575,9 +702,74 @@ void WSI::wait_swapchain_latency()
 	}
 }
 
-void WSI::set_low_latency_mode(bool enable)
+void WSI::emit_end_of_frame_markers()
 {
-	low_latency_mode_enable = enable;
+	if (device->get_device_features().supports_low_latency2_nv && swapchain &&
+	    low_latency_mode_enable_gpu_submit)
+	{
+		VkSetLatencyMarkerInfoNV latency_marker_info = { VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV };
+		latency_marker_info.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
+		latency_marker_info.presentID = next_present_id;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+
+		latency_marker_info.marker = VK_LATENCY_MARKER_RENDERSUBMIT_END_NV;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+	}
+}
+
+void WSI::emit_marker_pre_present()
+{
+	if (device->get_device_features().supports_low_latency2_nv && swapchain &&
+	    low_latency_mode_enable_gpu_submit)
+	{
+		VkSetLatencyMarkerInfoNV latency_marker_info = { VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV };
+		latency_marker_info.marker = VK_LATENCY_MARKER_PRESENT_START_NV;
+		latency_marker_info.presentID = next_present_id;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+	}
+	else if (device->get_device_features().anti_lag_features.antiLag && low_latency_anti_lag_present_valid)
+	{
+		VkAntiLagDataAMD anti_lag = { VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD };
+		VkAntiLagPresentationInfoAMD present_info = { VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD };
+		anti_lag.pPresentationInfo = &present_info;
+		present_info.stage = VK_ANTI_LAG_STAGE_PRESENT_AMD;
+		present_info.frameIndex = low_latency_semaphore_value;
+		anti_lag.mode = low_latency_mode_enable_gpu_submit ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+		device->get_device_table().vkAntiLagUpdateAMD(device->get_device(), &anti_lag);
+		low_latency_anti_lag_present_valid = false;
+	}
+}
+
+void WSI::emit_marker_post_present()
+{
+	if (device->get_device_features().supports_low_latency2_nv && swapchain &&
+	    low_latency_mode_enable_gpu_submit)
+	{
+		VkSetLatencyMarkerInfoNV latency_marker_info = { VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV };
+		latency_marker_info.marker = VK_LATENCY_MARKER_PRESENT_END_NV;
+		latency_marker_info.presentID = next_present_id;
+		device->get_device_table().vkSetLatencyMarkerNV(device->get_device(), swapchain, &latency_marker_info);
+	}
+}
+
+void WSI::set_present_low_latency_mode(bool enable)
+{
+	low_latency_mode_enable_present = enable;
+}
+
+void WSI::set_gpu_submit_low_latency_mode(bool enable)
+{
+	if (device && device->get_device_features().supports_low_latency2_nv && swapchain &&
+	    low_latency_mode_enable_gpu_submit != enable)
+	{
+		VkLatencySleepModeInfoNV sleep_mode_info = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV };
+		sleep_mode_info.lowLatencyBoost = enable;
+		sleep_mode_info.lowLatencyMode = enable;
+		if (table->vkSetLatencySleepModeNV(context->get_device(), swapchain, &sleep_mode_info) != VK_SUCCESS)
+			LOGE("Failed to set low latency sleep mode.\n");
+	}
+
+	low_latency_mode_enable_gpu_submit = enable;
 }
 
 #ifdef HAVE_WSI_DXGI_INTEROP
@@ -587,9 +779,10 @@ bool WSI::begin_frame_dxgi()
 
 	while (!acquire)
 	{
-		if (!dxgi->acquire(acquire, swapchain_index))
+		if (!dxgi->acquire(acquire))
 			return false;
 
+		swapchain_index = 0;
 		acquire->signal_external();
 		has_acquired_swapchain_index = true;
 
@@ -628,6 +821,687 @@ bool WSI::begin_frame_dxgi()
 	return true;
 }
 #endif
+
+void WSI::update_present_timing_properties()
+{
+	VkSwapchainTimingPropertiesEXT props = { VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT };
+	uint64_t counter = 0;
+	if (table->vkGetSwapchainTimingPropertiesEXT(context->get_device(), swapchain, &props, &counter) != VK_SUCCESS)
+		return;
+
+	if (counter == present_timing.refresh_counter && present_timing.has_refresh_feedback)
+		return;
+
+	present_timing.refresh_counter = counter;
+	present_timing.refresh_duration = props.refreshDuration;
+	present_timing.refresh_interval = props.refreshInterval;
+
+	const char *refresh_mode = "Unknown";
+
+	if (props.refreshInterval == 0)
+	{
+		// Wayland issue: It cannot figure out VRR vs FRR. Seems like we will need presentation-timing v3.
+		present_timing.refresh_mode = RefreshMode::Unknown;
+	}
+	else if (props.refreshInterval == UINT64_MAX)
+	{
+		present_timing.refresh_mode = RefreshMode::VRR;
+		refresh_mode = "VRR";
+	}
+	else
+	{
+		present_timing.refresh_mode = RefreshMode::FRR;
+		refresh_mode = "FRR";
+	}
+
+	if (present_timing.refresh_duration)
+	{
+		(void)refresh_mode;
+#ifdef VULKAN_DEBUG
+		LOGI("Present timing (count %llu): detected refresh duration of %llu nsec (%.6f Hz), mode %s.\n",
+			 static_cast<unsigned long long>(counter),
+		     static_cast<unsigned long long>(present_timing.refresh_duration),
+		     1e9 / double(present_timing.refresh_duration), refresh_mode);
+#endif
+	}
+
+	present_timing.has_refresh_feedback = true;
+}
+
+void WSI::recalibrate_present_timing_domains()
+{
+	if (!context->get_enabled_device_features().supports_calibrated_timestamps)
+		return;
+
+	present_timing.calibration.clear();
+
+	uint32_t count;
+	vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(context->get_gpu(), &count, nullptr);
+	Util::SmallVector<VkTimeDomainKHR> domains(count);
+	vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(context->get_gpu(), &count, domains.data());
+	domains.resize(count);
+
+#ifdef _WIN32
+	constexpr auto host_domain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+	constexpr auto host_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+
+	if (std::find(domains.begin(), domains.end(), host_domain) == domains.end())
+	{
+		LOGW("Cannot calibrate timestamp domain %u\n", host_domain);
+		return;
+	}
+
+	present_timing.calibration.resize(present_timing.time_domains.size());
+
+	for (size_t i = 0, n = present_timing.time_domains.size(); i < n; i++)
+	{
+		if (present_timing.time_domains[i] == host_domain)
+		{
+			present_timing.calibration[i] = { 1, { 1, 1, 1, 1 } };
+			continue;
+		}
+
+		if (std::find(domains.begin(), domains.end(), present_timing.time_domains[i]) == domains.end())
+		{
+			LOGW("Cannot calibrate timestamp domain %u\n", host_domain);
+			return;
+		}
+
+		VkCalibratedTimestampInfoKHR infos[2] = {};
+		infos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+		infos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+		infos[0].timeDomain = host_domain;
+		infos[1].timeDomain = present_timing.time_domains[i];
+		uint64_t timestamps[2] = {};
+		uint64_t max_deviation;
+
+		VkSwapchainCalibratedTimestampInfoEXT swapchain_info =
+				{ VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT };
+
+		if (present_timing.time_domains[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)
+		{
+			// Every present stage has a unique time domain, query each stage one-by-one.
+			infos[1].pNext = &swapchain_info;
+			swapchain_info.timeDomainId = present_timing.time_domain_ids[i];
+			swapchain_info.swapchain = swapchain;
+
+			Util::for_each_bit(supports_present_timing.feedback, [&](unsigned bit) {
+				swapchain_info.presentStage = 1u << bit;
+
+				if (table->vkGetCalibratedTimestampsKHR(context->get_device(), 2, infos,
+				                                        timestamps, &max_deviation) != VK_SUCCESS)
+				{
+					LOGE("Failed to get calibrated timestamps.\n");
+					return;
+				}
+
+				present_timing.calibration[i].host_time = timestamps[0];
+				present_timing.calibration[i].stage_times[bit] = timestamps[1];
+			});
+		}
+		else if (present_timing.time_domains[i] == VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT)
+		{
+			infos[1].pNext = &swapchain_info;
+			swapchain_info.timeDomainId = present_timing.time_domain_ids[i];
+			swapchain_info.swapchain = swapchain;
+
+			if (table->vkGetCalibratedTimestampsKHR(context->get_device(), 2, infos,
+			                                        timestamps, &max_deviation) != VK_SUCCESS)
+			{
+				LOGE("Failed to get calibrated timestamps.\n");
+				return;
+			}
+
+			present_timing.calibration[i].host_time = timestamps[0];
+			Util::for_each_bit(supports_present_timing.feedback, [&](unsigned bit) {
+				present_timing.calibration[i].stage_times[bit] = timestamps[1];
+			});
+		}
+		else
+		{
+			// This probably needs spec clarification.
+			// We assume it's normal nanoseconds for now.
+			if (infos[1].timeDomain == VK_TIME_DOMAIN_DEVICE_KHR &&
+			    (context->get_gpu_props().limits.timestampPeriod != 1.0f ||
+			     context->get_queue_info().timestamp_valid_bits != 64))
+			{
+				LOGW("Implementation reports DEVICE domain timestamps, "
+					 "but it's unclear how to deal with non-trivial periods and valid bits.\n");
+			}
+
+			if (table->vkGetCalibratedTimestampsKHR(context->get_device(), 2, infos,
+													timestamps, &max_deviation) != VK_SUCCESS)
+			{
+				LOGE("Failed to get calibrated timestamps.\n");
+				return;
+			}
+
+			present_timing.calibration[i].host_time = timestamps[0];
+			Util::for_each_bit(supports_present_timing.feedback, [&](unsigned bit) {
+				present_timing.calibration[i].stage_times[bit] = timestamps[1];
+			});
+		}
+	}
+
+#ifdef _WIN32
+	LARGE_INTEGER freq;
+	QueryPerformanceFrequency(&freq);
+	for (auto &calibration : present_timing.calibration)
+		calibration.host_time = uint64_t(1e9 * calibration.host_time / double(freq.QuadPart));
+#endif
+
+	if (present_timing.present_stage == 0)
+	{
+		// Make sure that our requests use a supported time domain, otherwise NV driver gets confused.
+		for (size_t i = 0, n = present_timing.calibration.size(); i < n; i++)
+		{
+			auto &cal = present_timing.calibration[i];
+			if (cal.host_time &&
+			    std::any_of(std::begin(cal.stage_times), std::end(cal.stage_times), [](uint64_t v) { return v != 0; }))
+			{
+				present_timing.time_domain = present_timing.time_domains[i];
+				present_timing.time_domain_id = present_timing.time_domain_ids[i];
+				break;
+			}
+		}
+	}
+}
+
+void WSI::update_time_domain_properties()
+{
+	VkSwapchainTimeDomainPropertiesEXT time_domain_properties = { VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT };
+	time_domain_properties.timeDomainCount = 1; // Workaround VVL.
+	if (table->vkGetSwapchainTimeDomainPropertiesEXT(context->get_device(), swapchain, &time_domain_properties, nullptr) != VK_SUCCESS)
+	{
+		LOGE("Failed to query time domain properties.\n");
+		return;
+	}
+
+	present_timing.time_domains.resize(time_domain_properties.timeDomainCount);
+	present_timing.time_domain_ids.resize(time_domain_properties.timeDomainCount);
+	time_domain_properties.pTimeDomains = present_timing.time_domains.data();
+	time_domain_properties.pTimeDomainIds = present_timing.time_domain_ids.data();
+
+	if (table->vkGetSwapchainTimeDomainPropertiesEXT(context->get_device(), swapchain,
+	                                                 &time_domain_properties,
+	                                                 &present_timing.time_domain_counter) != VK_SUCCESS)
+	{
+		LOGE("Failed to query time domain properties.\n");
+		return;
+	}
+
+#ifdef VULKAN_DEBUG
+	for (uint32_t i = 0; i < time_domain_properties.timeDomainCount; i++)
+	{
+		LOGI("Got time domain %u, ID %llu\n",
+		     present_timing.time_domains[i],
+		     static_cast<unsigned long long>(present_timing.time_domain_ids[i]));
+	}
+#endif
+
+	present_timing.has_time_domain_props = true;
+	present_timing.need_recalibration = true;
+}
+
+void WSI::poll_present_timing_feedback()
+{
+	VkPastPresentationTimingEXT timings[PresentTimingQueueSize] = {};
+	VkPresentStageTimeEXT stage_time[PresentTimingQueueSize][4] = {};
+
+	for (uint32_t i = 0; i < PresentTimingQueueSize; i++)
+	{
+		auto &t = timings[i];
+		t.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+		t.pPresentStages = stage_time[i];
+		t.presentStageCount = 4;
+
+		// VVL workaround
+		for (auto &s : stage_time[i])
+			s.stage = VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+	}
+
+	VkPastPresentationTimingInfoEXT info = { VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT };
+	VkPastPresentationTimingPropertiesEXT props = { VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT };
+	props.presentationTimingCount = PresentTimingQueueSize;
+	props.pPresentationTimings = timings;
+	info.swapchain = swapchain;
+
+	if (table->vkGetPastPresentationTimingEXT(context->get_device(), &info, &props) != VK_SUCCESS)
+		return;
+
+	if (props.presentationTimingCount == 0)
+		return;
+
+	if (props.timingPropertiesCounter != present_timing.refresh_counter)
+		update_present_timing_properties();
+
+	// NV bug on X11: props.timingPropertiesCounter is always 0, even if TimingPropertiesEXT returns 1.
+	if (props.timingPropertiesCounter != 0 && props.timingPropertiesCounter != present_timing.refresh_counter)
+	{
+		LOGW("Got presentation timing counter (%llu) which does not map to current state of swapchain (%llu).\n",
+		     static_cast<unsigned long long>(props.timingPropertiesCounter),
+		     static_cast<unsigned long long>(present_timing.refresh_counter));
+	}
+
+	// NV bug on X11: timeDomainsCount remains 0.
+	if ((props.timeDomainsCounter != 0 && props.timeDomainsCounter != present_timing.time_domain_counter) ||
+	    !present_timing.has_time_domain_props)
+	{
+		update_time_domain_properties();
+	}
+
+	auto current_time = Util::get_current_time_nsecs();
+	if (present_timing.last_recalibration_time + 1000000000 < current_time)
+	{
+		present_timing.need_recalibration = true;
+		present_timing.last_recalibration_time = current_time;
+	}
+
+	if (present_timing.need_recalibration)
+	{
+		recalibrate_present_timing_domains();
+		present_timing.need_recalibration = false;
+	}
+
+	for (uint32_t i = 0; i < props.presentationTimingCount; i++)
+	{
+		// By default, these reports must be sorted based on QueuePresent().
+
+		auto &timing = props.pPresentationTimings[i];
+
+		if (!timing.reportComplete)
+		{
+			// This should never happen since we don't request partial timestamps.
+			LOGE("Implementation does not report complete timestamps?\n");
+			continue;
+		}
+
+#ifdef VULKAN_DEBUG
+		LOGI("Timing for presentID %llu, time domain %u, time domain ID %llu:\n",
+		     static_cast<unsigned long long>(timing.presentId),
+		     timing.timeDomain, static_cast<unsigned long long>(timing.timeDomainId));
+#endif
+
+		present_timing.present_stage = 0;
+		present_timing.reference_time = 0;
+		present_timing.present_id = timing.presentId;
+		present_timing.time_domain = timing.timeDomain;
+		present_timing.time_domain_id = timing.timeDomainId;
+
+		// Try to calibrate the timestamp so we can report them in host time domain.
+		const CalibratedTimestamp *calibrated = nullptr;
+		for (size_t j = 0, n = present_timing.time_domain_ids.size(); j < n; j++)
+		{
+			if (present_timing.time_domain_ids[j] == timing.timeDomainId)
+			{
+				if (j < present_timing.calibration.size())
+					calibrated = &present_timing.calibration[j];
+				break;
+			}
+		}
+
+		if (calibrated && calibrated->host_time == 0)
+			calibrated = nullptr;
+
+		std::sort(timing.pPresentStages, timing.pPresentStages + timing.presentStageCount,
+		          [](const VkPresentStageTimeEXT &a, const VkPresentStageTimeEXT &b) { return a.stage < b.stage; });
+
+		present_timing.present_done_host_time = 0;
+		present_timing.gpu_done_host_time = 0;
+
+		for (uint32_t stage_index = 0; stage_index < timing.presentStageCount; stage_index++)
+		{
+			auto &stage = timing.pPresentStages[stage_index];
+
+			// Safety. Shouldn't happen since we don't request it.
+			// Time of 0 can happen according to spec and means timing information is not available.
+			// Can happen for e.g. discarded, occluded surfaces on WL. Just skip the update.
+			if (stage.stage > VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT || stage.stage == 0 || stage.time == 0)
+				continue;
+
+			uint64_t calibrated_stage_time = calibrated ? calibrated->stage_times[Util::trailing_zeroes(stage.stage)] : 0;
+#ifdef VULKAN_DEBUG
+			static const char *stage_tags[] = { "QueueOperations", "Dequeued", "FirstPixelOut", "FirstPixelVisible" };
+			const char *stage_tag = stage_tags[Util::trailing_zeroes(stage.stage)];
+#endif
+
+			if (calibrated)
+			{
+				uint64_t calibrated_ts = calibrated->host_time + (stage.time - calibrated_stage_time);
+				if (stage.stage == VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT)
+					present_timing.gpu_done_host_time = calibrated_ts;
+				else
+					present_timing.present_done_host_time = calibrated_ts;
+#ifdef VULKAN_DEBUG
+				LOGI("  %s: %.3f s (calibrated)\n", stage_tag, calibrated_ts * 1e-9);
+#endif
+			}
+#ifdef VULKAN_DEBUG
+			else
+			{
+				LOGI("  %s: %llu (raw ns)\n", stage_tag, static_cast<unsigned long long>(stage.time));
+			}
+#endif
+
+			present_timing.present_stage = stage.stage;
+			present_timing.reference_time = stage.time;
+		}
+
+		auto itr = std::find_if(
+				present_timing.error_stats.begin(), present_timing.error_stats.end(),
+				[&](const ErrorStats &err) {
+					return err.present_id == timing.presentId;
+				});
+
+		present_timing.presentation_time_error = 0;
+
+		if (itr != present_timing.error_stats.end())
+		{
+			// Retire the pending compensation.
+			present_timing.pending_compensation -= itr->compensation;
+
+			if (present_timing.present_done_host_time && itr->target_absolute)
+			{
+				auto err = int64_t(present_timing.present_done_host_time) - int64_t(itr->target_absolute);
+				present_timing.presentation_time_error = err;
+#ifdef VULKAN_DEBUG
+				LOGI("    Error: %.3f ms\n", 1e-6 * double(err));
+#endif
+			}
+
+			present_timing.error_stats.erase(itr);
+		}
+
+		frr_pacer.set_frame_time_ns(present_timing.refresh_duration);
+
+		if (present_timing.present_done_host_time && present_timing.gpu_done_host_time)
+		{
+			frr_pacer.update_feedback(present_timing.present_id, present_timing.gpu_done_host_time,
+			                          present_timing.present_done_host_time);
+
+			if (auto *timeline = device->get_system_handles().timeline_trace_file)
+			{
+				auto wrapped_id = present_timing.present_id % (present_frame_latency + 1);
+				auto *e = timeline->allocate_event();
+				e->set_desc("flip-gap");
+				e->set_tid(("WSI flipgap" + std::to_string(wrapped_id)).c_str());
+				e->pid = 0;
+				e->counter = present_timing.present_id;
+				e->start_ns = present_timing.gpu_done_host_time;
+				e->end_ns = present_timing.present_done_host_time;
+				timeline->submit_event(e);
+			}
+		}
+	}
+}
+
+void WSI::set_present_timing_request(VkPresentTimingInfoEXT &timing)
+{
+	// No stable way to set targets yet.
+	if (present_timing.refresh_duration == 0 || present_timing.reference_time == 0 ||
+	    present_timing.present_done_host_time == 0)
+		return;
+
+	// Presentation timing is only meaningful for FIFO.
+	if (active_present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+	    active_present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR &&
+	    active_present_mode != VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)
+		return;
+
+	// Not supported.
+	if (!supports_present_timing.absolute && !supports_present_timing.relative)
+		return;
+
+	// No request to set time.
+	if (present_timing.target_absolute_time == 0 && present_timing.target_relative_time == 0)
+		return;
+
+	uint64_t relative_time = present_timing.target_relative_time;
+	if (relative_time && !present_timing.force_vrr && present_timing.refresh_mode != RefreshMode::VRR)
+	{
+		// If we keep accumulating relative time in a non-locked way, we'll get terrible pacing.
+		// Realign the relative time to boundary unless we're in VRR mode.
+
+		uint64_t interval = present_timing.refresh_duration;
+		relative_time = std::max<uint64_t>(relative_time, interval);
+
+		// The refresh interval represents the alignment of a refresh cycle.
+		// Duration is a multiple of interval.
+		if (present_timing.refresh_interval)
+			interval = present_timing.refresh_interval;
+
+		auto cycles = (relative_time + interval - 1) / interval;
+		relative_time = interval * cycles;
+	}
+
+	// VRR does not have to align to boundaries, so rounding is somewhat meaningless.
+	if (present_timing.refresh_mode != RefreshMode::VRR && !present_timing.force_vrr)
+		timing.flags |= VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT;
+
+	if (present_timing.time_domain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)
+		timing.targetTimeDomainPresentStage = present_timing.present_stage;
+
+	uint64_t minimum_interval = present_timing.refresh_duration;
+
+	if (supports_present_timing.relative && relative_time)
+	{
+		// Relative time is very nice, since it's not our job to align frames :)
+		timing.flags |= VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT;
+		timing.targetTime = relative_time;
+
+		// If we're using pure relative timing, we don't care about error accumulation and compensation,
+		// since it's expected that application will be driven by feedback rather than opposite.
+	}
+	else
+	{
+		if (!supports_present_timing.absolute)
+		{
+			// Ensure that we don't attempt to compensate for errors when absolute times are very tight.
+			// The emulated relative time must never be smaller than duration.
+			relative_time = std::max<uint64_t>(relative_time, present_timing.refresh_duration);
+		}
+
+		// If presentations get sufficiently delayed, we will need to catch up with our internal accumulator.
+		// If we're using present interval > 1, we'll catch up in a few frames.
+		uint64_t estimated_minimum_time = present_timing.present_done_host_time +
+		                                  (present_last_id - present_timing.present_id) * minimum_interval;
+
+		present_timing.last_absolute_target_time =
+				std::max<uint64_t>(present_timing.last_absolute_target_time, estimated_minimum_time);
+
+		// Compute the target absolute timing.
+		uint64_t next_absolute_time = std::max<uint64_t>(
+				present_timing.last_absolute_target_time + relative_time,
+				present_timing.target_absolute_time);
+
+		int64_t compensation = 0;
+
+		if (supports_present_timing.absolute)
+		{
+			timing.targetTime = next_absolute_time;
+		}
+		else
+		{
+			if (present_timing.last_absolute_target_time)
+			{
+				// This is kinda crude. We're emulating absolute timestamp with relative.
+				timing.targetTime = std::max<uint64_t>(next_absolute_time, present_timing.last_absolute_target_time) -
+				                    present_timing.last_absolute_target_time;
+
+				// Safety against deadlocks.
+				timing.targetTime = std::min<uint64_t>(timing.targetTime, 1000 * 1000 * 1000);
+
+				// If we lost frames, relative timing will remain delayed, so pull back the relative timing
+				// to realign with absolute time.
+				// The value can be negative in theory if we got back frames too early,
+				// but that shouldn't really happen.
+				int64_t in_flight_error = present_timing.presentation_time_error - present_timing.pending_compensation;
+
+				VK_ASSERT(timing.targetTime >= present_timing.refresh_duration);
+
+				// Don't aim to compensate all error in one go. That seems to create some unfortunate feedback loop effects,
+				// especially on Windows. We'll accept some error as long as it means more stable pacing.
+				compensation = std::min<int64_t>(timing.targetTime - present_timing.refresh_duration, in_flight_error / 2);
+				timing.targetTime -= compensation;
+
+#ifdef _WIN32
+				if (device->get_device_features().driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+				    (timing.flags & VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT) != 0)
+				{
+					// The driver seems very temperamental here, and it seems to round down the relative time
+					// to DXGI present intervals or something (which is a bug) ... Realign the next_absolute_time exactly.
+					uint64_t interval = present_timing.refresh_interval ?
+						present_timing.refresh_interval : present_timing.refresh_duration;
+
+					auto cycles = (timing.targetTime + interval / 2) / interval;
+					auto new_relative_time = cycles * interval;
+					auto adj = new_relative_time - timing.targetTime;
+					next_absolute_time += adj;
+					compensation -= adj;
+					timing.targetTime = new_relative_time;
+				}
+#endif
+
+				present_timing.pending_compensation += compensation;
+
+#ifdef VULKAN_DEBUG
+				LOGI("Relative target time: %.3f ms.\n", timing.targetTime * 1e-6);
+				LOGI("  Abs target time: %.3f ms.\n", next_absolute_time * 1e-6);
+				LOGI("  Compensation offset: %.3f ms\n", compensation * 1e-6);
+#endif
+			}
+
+			timing.flags |= VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT;
+		}
+
+		present_timing.last_absolute_target_time = next_absolute_time;
+		present_timing.error_stats.push_back({ next_present_id, next_absolute_time, compensation });
+
+		// If we keep accumulating time through relative time emulation, we need to account for clock drift.
+		if (supports_present_timing.absolute && relative_time &&
+		    present_timing.refresh_mode != RefreshMode::VRR && !present_timing.force_vrr)
+		{
+			uint64_t interval = present_timing.refresh_interval ?
+			                    present_timing.refresh_interval : present_timing.refresh_duration;
+
+			uint64_t align =
+					(present_timing.last_absolute_target_time - present_timing.present_done_host_time) % interval;
+
+			// Try to quickly-ish align to a refresh cycle.
+			if (align > interval / 2)
+				present_timing.last_absolute_target_time += (interval - align) / 8;
+			else
+				present_timing.last_absolute_target_time -= align / 8;
+		}
+	}
+
+	if ((timing.flags & VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT) == 0)
+	{
+		bool has_calibrated_time = false;
+		size_t n = std::min<size_t>(present_timing.time_domain_ids.size(), present_timing.calibration.size());
+
+		for (size_t i = 0; i < n; i++)
+		{
+			if (present_timing.time_domain_ids[i] == timing.timeDomainId)
+			{
+				auto &c = present_timing.calibration[i];
+
+				// Spec seems to suggest that targetTime is always in terms of FIRST_PIXEL_VISIBLE,
+				// but we can only use timestamps based on the latest present stage we get feedback for.
+				uint64_t stage_time = c.stage_times[Util::trailing_zeroes(present_timing.present_stage)];
+
+				if (stage_time == 0)
+				{
+					LOGW("Cannot compute targetTime.\n");
+				}
+				else
+				{
+					// Recompute the absolute time to target the domain.
+					timing.targetTime = (timing.targetTime - c.host_time) + stage_time;
+
+					if (timing.targetTime >= (1ull << 63))
+						LOGW("Detected strange overflow, ignoring time request.\n");
+					else
+						has_calibrated_time = true;
+				}
+
+				break;
+			}
+		}
+
+		if (!has_calibrated_time)
+			timing.targetTime = 0;
+	}
+
+	// Completely meaningless to keep targeting absolute.
+	present_timing.target_absolute_time = 0;
+}
+
+bool WSI::get_presentation_stats(PresentationStats &stats) const
+{
+	if (!present_timing.reference_time)
+		return false;
+
+	stats.feedback_present_id = present_timing.present_id;
+	stats.gpu_done_ts = present_timing.gpu_done_host_time;
+	stats.present_done_ts = present_timing.present_done_host_time;
+	stats.error = present_timing.presentation_time_error;
+	return true;
+}
+
+bool WSI::get_refresh_rate_info(RefreshRateInfo &info) const
+{
+	if (present_timing.refresh_duration == 0)
+		return false;
+
+	info.refresh_duration = present_timing.refresh_duration;
+	info.refresh_interval = present_timing.refresh_interval;
+	info.mode = present_timing.refresh_mode;
+	return true;
+}
+
+uint64_t WSI::get_last_submitted_present_id() const
+{
+	return present_last_id;
+}
+
+bool WSI::set_target_presentation_time(uint64_t absolute_time_ns, uint64_t relative_time_ns, bool force_vrr)
+{
+	present_timing.target_absolute_time = absolute_time_ns;
+	present_timing.target_relative_time = relative_time_ns;
+	present_timing.force_vrr = force_vrr;
+
+	if (absolute_time_ns || relative_time_ns)
+		present_feedback_enable = true;
+
+	if (active_present_mode != VK_PRESENT_MODE_FIFO_KHR &&
+	    active_present_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR &&
+	    active_present_mode != VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)
+		return false;
+
+	return present_timing.refresh_duration != 0 && present_timing.reference_time != 0 &&
+	       present_timing.present_done_host_time != 0 &&
+	       (supports_present_timing.relative || supports_present_timing.absolute);
+}
+
+void WSI::set_enable_timing_feedback(bool enable)
+{
+	present_feedback_enable = enable;
+}
+
+void WSI::set_fixed_rate_low_latency_pacer(bool enable)
+{
+	frr_pacer_enable = enable;
+	if (!frr_pacer_enable)
+		frr_pacer.reset();
+}
+
+FixedRefreshRatePacer &WSI::get_fixed_rate_pacer()
+{
+	return frr_pacer;
+}
 
 bool WSI::begin_frame()
 {
@@ -683,8 +1557,9 @@ bool WSI::begin_frame()
 		Fence fence;
 
 		// TODO: Improve this with fancier approaches as needed.
-		if (low_latency_mode_enable &&
+		if (low_latency_mode_enable_present &&
 		    !device->get_device_features().present_wait_features.presentWait &&
+		    !supports_present_wait2 &&
 		    current_present_mode == PresentMode::SyncToVBlank)
 		{
 			fence = device->request_legacy_fence();
@@ -734,6 +1609,21 @@ bool WSI::begin_frame()
 
 			wait_swapchain_latency();
 
+			if (supports_present_timing.feedback)
+			{
+				update_present_timing_properties();
+				poll_present_timing_feedback();
+			}
+
+			if (frr_pacer_enable)
+			{
+				auto pace_start_ts = device->write_calibrated_timestamp();
+				frr_pacer.begin_frame_submission(next_present_id);
+				device->register_time_interval(
+					"WSI", std::move(pace_start_ts), device->write_calibrated_timestamp(),
+					"pacer-wait");
+			}
+
 			auto frame_time = platform->get_frame_timer().frame();
 			auto elapsed_time = platform->get_frame_timer().get_elapsed();
 
@@ -747,6 +1637,11 @@ bool WSI::begin_frame()
 			platform->event_swapchain_index(device.get(), swapchain_index);
 
 			device->set_acquire_semaphore(swapchain_index, acquire);
+			if (device->get_device_features().present_id_features.presentId ||
+			    device->get_device_features().present_id2_features.presentId2)
+			{
+				device->set_present_id(swapchain, next_present_id);
+			}
 		}
 		else if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
 		{
@@ -781,6 +1676,25 @@ bool WSI::end_frame_dxgi()
 }
 #endif
 
+void WSI::set_frame_duplication_aware(bool enable, uint32_t target_image_count)
+{
+	frame_dupe_aware = enable;
+	frame_dupe_target_images = target_image_count;
+
+	if (!has_acquired_swapchain_index && (current_frame_dupe_aware != frame_dupe_aware ||
+	                                      current_frame_dupe_target_images != frame_dupe_target_images))
+	{
+		current_frame_dupe_aware = frame_dupe_aware;
+		current_frame_dupe_target_images = frame_dupe_target_images;
+		update_framebuffer(swapchain_width, swapchain_height);
+	}
+}
+
+void WSI::set_next_present_is_duplicated()
+{
+	next_present_is_dupe = true;
+}
+
 bool WSI::end_frame()
 {
 	device->end_frame_context();
@@ -798,6 +1712,7 @@ bool WSI::end_frame()
 		if (!device->swapchain_touched())
 			return true;
 
+		emit_end_of_frame_markers();
 		has_acquired_swapchain_index = false;
 
 #ifdef HAVE_WSI_DXGI_INTEROP
@@ -822,15 +1737,24 @@ bool WSI::end_frame()
 		info.pImageIndices = &swapchain_index;
 		info.pResults = &result;
 
-		VkSwapchainPresentFenceInfoEXT present_fence = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT };
-		VkSwapchainPresentModeInfoEXT present_mode_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT };
+		VkSwapchainPresentFenceInfoKHR present_fence = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR };
+		VkSwapchainPresentModeInfoKHR present_mode_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR };
 		VkPresentIdKHR present_id_info = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+		VkPresentId2KHR present_id2_info = { VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR };
+		VkPresentTimingsInfoEXT timings_info = { VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT };
+		VkPresentTimingInfoEXT timing_info = { VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT };
 
-		if (device->get_device_features().present_id_features.presentId)
+		if (supports_present_wait2)
+		{
+			present_id2_info.swapchainCount = 1;
+			present_id2_info.pPresentIds = &next_present_id;
+			present_id2_info.pNext = info.pNext;
+			info.pNext = &present_id2_info;
+		}
+		else if (device->get_device_features().present_id_features.presentId)
 		{
 			present_id_info.swapchainCount = 1;
-			present_id_info.pPresentIds = &present_id;
-			present_id++;
+			present_id_info.pPresentIds = &next_present_id;
 			present_id_info.pNext = info.pNext;
 			info.pNext = &present_id_info;
 		}
@@ -840,16 +1764,37 @@ bool WSI::end_frame()
 
 		if (device->get_device_features().swapchain_maintenance1_features.swapchainMaintenance1)
 		{
-			last_present_fence = device->request_legacy_fence();
-			present_fence.swapchainCount = 1;
-			present_fence.pFences = &last_present_fence->get_fence();
-			present_fence.pNext = const_cast<void *>(info.pNext);
-			info.pNext = &present_fence;
+			if (!device->get_workarounds().broken_present_fence)
+			{
+				last_present_fence = device->request_legacy_fence();
+				present_fence.swapchainCount = 1;
+				present_fence.pFences = &last_present_fence->get_fence();
+				present_fence.pNext = const_cast<void *>(info.pNext);
+				info.pNext = &present_fence;
+			}
 
 			present_mode_info.swapchainCount = 1;
 			present_mode_info.pPresentModes = &active_present_mode;
 			present_mode_info.pNext = const_cast<void *>(info.pNext);
 			info.pNext = &present_mode_info;
+		}
+
+		if (supports_present_timing.feedback && present_feedback_enable)
+		{
+			timing_info.presentStageQueries = supports_present_timing.feedback;
+			timing_info.timeDomainId = present_timing.time_domain_id;
+			set_present_timing_request(timing_info);
+
+			timings_info.swapchainCount = 1;
+			timings_info.pTimingInfos = &timing_info;
+			timings_info.pNext = info.pNext;
+			info.pNext = &timings_info;
+		}
+		else
+		{
+			// Clear out state so that we don't risk a massive stall after timing re-enabled.
+			present_timing.present_done_host_time = 0;
+			present_timing.present_id = 0;
 		}
 
 #ifdef VULKAN_WSI_TIMING_DEBUG
@@ -859,14 +1804,17 @@ bool WSI::end_frame()
 		auto present_ts = device->write_calibrated_timestamp();
 
 		device->external_queue_lock();
+		emit_marker_pre_present();
 #if defined(ANDROID) && defined(HAVE_SWAPPY)
 		VkResult overall = SwappyVk_queuePresent(device->get_current_present_queue(), &info);
 #else
 		VkResult overall = table->vkQueuePresentKHR(device->get_current_present_queue(), &info);
 #endif
+		emit_marker_post_present();
 		device->external_queue_unlock();
 
-		device->register_time_interval("WSI", std::move(present_ts), device->write_calibrated_timestamp(), "present");
+		device->register_time_interval("WSI", std::move(present_ts), device->write_calibrated_timestamp(),
+			"present", next_present_id);
 
 #if defined(ANDROID)
 		// Android 10 can return suboptimal here, only because of pre-transform.
@@ -888,13 +1836,29 @@ bool WSI::end_frame()
 		LOGI("vkQueuePresentKHR took %.3f ms.\n", (present_end - present_start) * 1e-6);
 #endif
 
+		bool dupes_frame = next_present_is_dupe && current_frame_dupe_aware && !low_latency_mode_enable_present;
+
 		// The presentID only seems to get updated if QueuePresent returns success.
 		// This makes sense I guess. Record the latest present ID which was successfully presented
 		// so we don't risk deadlock.
 		if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) &&
-		    device->get_device_features().present_id_features.presentId)
+		    (device->get_device_features().present_id_features.presentId || supports_present_wait2) &&
+		    !dupes_frame)
 		{
-			present_last_id = present_id;
+			present_last_id = next_present_id;
+		}
+
+		next_present_id++;
+		next_present_is_dupe = false;
+
+		if (dupes_frame)
+		{
+			duplicated_frames++;
+		}
+		else
+		{
+			last_duplicated_frames = duplicated_frames;
+			duplicated_frames = 0;
 		}
 
 		if (overall == VK_SUBOPTIMAL_KHR || result == VK_SUBOPTIMAL_KHR)
@@ -907,6 +1871,13 @@ bool WSI::end_frame()
 
 		// The present semaphore is consumed even on OUT_OF_DATE, etc.
 		release->wait_external();
+
+		if (!device->get_workarounds().broken_present_fence &&
+		    device->get_device_features().swapchain_maintenance1_features.swapchainMaintenance1)
+		{
+			deferred_semaphore.push_back({ std::move(release), last_present_fence });
+			release = {};
+		}
 
 		if (overall < 0 || result < 0)
 		{
@@ -924,18 +1895,39 @@ bool WSI::end_frame()
 		}
 
 		// Re-init swapchain.
-		if (present_mode != current_present_mode || backbuffer_format != current_backbuffer_format ||
-		    extra_usage != current_extra_usage)
+		if (present_mode != current_present_mode ||
+		    has_backbuffer_format_delta() ||
+		    extra_usage != current_extra_usage ||
+		    compression.type != current_compression.type ||
+		    compression.fixed_rates != current_compression.fixed_rates ||
+		    frame_dupe_aware != current_frame_dupe_aware ||
+		    frame_dupe_target_images != current_frame_dupe_target_images)
 		{
 			current_present_mode = present_mode;
 			current_backbuffer_format = backbuffer_format;
 			current_extra_usage = extra_usage;
+			current_compression = compression;
+			current_custom_backbuffer_format = custom_backbuffer_format;
+			current_frame_dupe_aware = frame_dupe_aware;
+			current_frame_dupe_target_images = frame_dupe_target_images;
 			update_framebuffer(swapchain_width, swapchain_height);
 		}
 	}
 
-	nonblock_delete_swapchains();
+	nonblock_delete_swapchain_resources();
 	return true;
+}
+
+bool WSI::has_backbuffer_format_delta() const
+{
+	bool has_format_delta = backbuffer_format != current_backbuffer_format;
+	if (!has_format_delta && backbuffer_format == BackbufferFormat::Custom)
+	{
+		has_format_delta = current_custom_backbuffer_format.format != custom_backbuffer_format.format ||
+		                   current_custom_backbuffer_format.colorSpace != custom_backbuffer_format.colorSpace;
+	}
+
+	return has_format_delta;
 }
 
 void WSI::update_framebuffer(unsigned width, unsigned height)
@@ -1039,11 +2031,34 @@ void WSI::set_extra_usage_flags(VkImageUsageFlags usage)
 void WSI::set_backbuffer_format(BackbufferFormat format)
 {
 	backbuffer_format = format;
-	if (!has_acquired_swapchain_index && backbuffer_format != current_backbuffer_format)
+
+	if (!has_acquired_swapchain_index && has_backbuffer_format_delta())
 	{
 		current_backbuffer_format = backbuffer_format;
+		current_custom_backbuffer_format = custom_backbuffer_format;
 		update_framebuffer(swapchain_width, swapchain_height);
 	}
+}
+
+void WSI::set_image_compression_control(const ImageCompression &comp)
+{
+	if (device && !device->get_device_features().image_compression_control_swapchain_features.imageCompressionControlSwapchain)
+		return;
+
+	compression = comp;
+	if (!has_acquired_swapchain_index &&
+	    (compression.type != current_compression.type ||
+	     compression.fixed_rates != current_compression.fixed_rates))
+	{
+		current_compression = compression;
+		update_framebuffer(swapchain_width, swapchain_height);
+	}
+}
+
+void WSI::set_custom_backbuffer_format(VkSurfaceFormatKHR format)
+{
+	custom_backbuffer_format = format;
+	set_backbuffer_format(BackbufferFormat::Custom);
 }
 
 void WSI::set_backbuffer_srgb(bool enable)
@@ -1053,6 +2068,8 @@ void WSI::set_backbuffer_srgb(bool enable)
 
 void WSI::teardown()
 {
+	low_latency_semaphore.reset();
+
 	if (platform)
 		platform->release_resources();
 
@@ -1104,6 +2121,7 @@ bool WSI::blocking_init_swapchain(unsigned width, unsigned height)
 		}
 	} while (err != SwapchainError::None);
 
+	frr_pacer.reset();
 	return swapchain != VK_NULL_HANDLE;
 }
 
@@ -1128,7 +2146,16 @@ VkSurfaceFormatKHR WSI::find_suitable_present_format(const std::vector<VkSurface
 		if (!device->image_format_is_supported(formats[i].format, features))
 			continue;
 
-		if (desired_format == BackbufferFormat::DisplayP3)
+		if (desired_format == BackbufferFormat::Custom)
+		{
+			if (formats[i].colorSpace == current_custom_backbuffer_format.colorSpace &&
+			    formats[i].format == current_custom_backbuffer_format.format)
+			{
+				format = formats[i];
+				break;
+			}
+		}
+		else if (desired_format == BackbufferFormat::DisplayP3)
 		{
 			if (formats[i].colorSpace == VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT &&
 			    (formats[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
@@ -1155,6 +2182,15 @@ VkSurfaceFormatKHR WSI::find_suitable_present_format(const std::vector<VkSurface
 			if (formats[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
 			    (formats[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
 			     formats[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))
+			{
+				format = formats[i];
+				break;
+			}
+		}
+		else if (desired_format == BackbufferFormat::scRGB)
+		{
+			if (formats[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT &&
+			    formats[i].format == VK_FORMAT_R16G16B16A16_SFLOAT)
 			{
 				format = formats[i];
 				break;
@@ -1192,12 +2228,18 @@ VkSurfaceFormatKHR WSI::find_suitable_present_format(const std::vector<VkSurface
 struct SurfaceInfo
 {
 	VkPhysicalDeviceSurfaceInfo2KHR surface_info;
-	VkSurfacePresentModeEXT present_mode;
+	VkSurfacePresentModeKHR present_mode;
 	VkSurfaceCapabilitiesKHR surface_capabilities;
 	std::vector<VkSurfaceFormatKHR> formats;
-	VkSwapchainPresentModesCreateInfoEXT present_modes_info;
+	VkSwapchainPresentModesCreateInfoKHR present_modes_info;
+	VkImageCompressionControlEXT compression_control;
+	VkImageCompressionFixedRateFlagsEXT compression_control_fixed_rates;
+	VkSurfaceCapabilitiesPresentId2KHR present_id2;
+	VkSurfaceCapabilitiesPresentWait2KHR present_wait2;
+	VkPresentTimingSurfaceCapabilitiesEXT present_timing;
 	std::vector<VkPresentModeKHR> present_mode_compat_group;
 	const void *swapchain_pnext;
+	VkSwapchainLatencyCreateInfoNV latency_create_info;
 #ifdef _WIN32
 	VkSurfaceFullScreenExclusiveInfoEXT exclusive_info;
 	VkSurfaceFullScreenExclusiveWin32InfoEXT exclusive_info_win32;
@@ -1206,6 +2248,7 @@ struct SurfaceInfo
 
 static bool init_surface_info(Device &device, WSIPlatform &platform,
 	VkSurfaceKHR surface, BackbufferFormat format,
+	const WSI::ImageCompression &compression,
 	PresentMode present_mode, SurfaceInfo &info, bool low_latency_mode_enable)
 {
 	if (surface == VK_NULL_HANDLE)
@@ -1242,7 +2285,8 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 		if (ext.driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS)
 			prefer_exclusive = false; // Broken on Intel Windows
 
-		if (ext.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && format == BackbufferFormat::HDR10)
+		if (ext.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY &&
+		    (format == BackbufferFormat::HDR10 || format == BackbufferFormat::scRGB))
 		{
 			LOGI("Win32: HDR requested on AMD Windows. Forcing exclusive fullscreen, or HDR will not work properly.\n");
 			prefer_exclusive = true;
@@ -1349,6 +2393,22 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 	if (ext.supports_surface_capabilities2)
 	{
 		VkSurfaceCapabilities2KHR surface_capabilities2 = { VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR };
+
+		if (ext.present_id2_features.presentId2 && ext.present_wait2_features.presentWait2)
+		{
+			info.present_wait2 = { VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR };
+			info.present_id2 = { VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR };
+			info.present_wait2.pNext = &info.present_id2;
+			surface_capabilities2.pNext = &info.present_wait2;
+		}
+
+		if (ext.present_timing_features.presentTiming)
+		{
+			info.present_timing = { VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT };
+			info.present_timing.pNext = surface_capabilities2.pNext;
+			surface_capabilities2.pNext = &info.present_timing;
+		}
+
 		if (vkGetPhysicalDeviceSurfaceCapabilities2KHR(gpu, &info.surface_info, &surface_capabilities2) != VK_SUCCESS)
 			return false;
 		info.surface_capabilities = surface_capabilities2.surfaceCapabilities;
@@ -1364,8 +2424,8 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 	    ext.supports_surface_capabilities2)
 	{
 		VkSurfaceCapabilities2KHR surface_capabilities2 = { VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR };
-		VkSurfacePresentModeCompatibilityEXT present_mode_caps =
-		    { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT };
+		VkSurfacePresentModeCompatibilityKHR present_mode_caps =
+		    { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR };
 		std::vector<VkPresentModeKHR> present_mode_compat_group;
 
 		present_mode_compat_group.resize(32);
@@ -1374,7 +2434,7 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 
 		info.present_mode.pNext = const_cast<void *>(info.surface_info.pNext);
 		info.surface_info.pNext = &info.present_mode;
-		info.present_mode = { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT };
+		info.present_mode = { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR };
 		info.present_mode.presentMode = swapchain_present_mode;
 
 		surface_capabilities2.pNext = &present_mode_caps;
@@ -1407,10 +2467,22 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 
 			// Accept the present mode if it does not modify minImageCount.
 			// If image count changes, we should probably recreate the swapchain.
-			if (surface_capabilities2.surfaceCapabilities.minImageCount == info.surface_capabilities.minImageCount)
+			// If we have present wait we're at no risk of adding more latency, so just go ahead.
+			if (surface_capabilities2.surfaceCapabilities.minImageCount == info.surface_capabilities.minImageCount ||
+			    device.get_device_features().present_wait_features.presentWait ||
+			    info.present_wait2.presentWait2Supported)
+			{
 				info.present_mode_compat_group.push_back(mode);
+				info.surface_capabilities.minImageCount =
+						std::max<uint32_t>(info.surface_capabilities.minImageCount,
+						                   surface_capabilities2.surfaceCapabilities.minImageCount);
+			}
 		}
 	}
+
+	// We want IMMEDIATE to come before MAILBOX if both are supported.
+	std::sort(info.present_mode_compat_group.begin(), info.present_mode_compat_group.end(),
+	          [](VkPresentModeKHR a, VkPresentModeKHR b) { return a < b; });
 
 	uint32_t format_count = 0;
 	if (ext.supports_surface_capabilities2)
@@ -1465,7 +2537,7 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 	// Allow for seamless toggle between presentation modes.
 	if (ext.swapchain_maintenance1_features.swapchainMaintenance1)
 	{
-		info.present_modes_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT };
+		info.present_modes_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR };
 		info.present_modes_info.pNext = const_cast<void *>(info.swapchain_pnext);
 		info.present_modes_info.presentModeCount = info.present_mode_compat_group.size();
 		info.present_modes_info.pPresentModes = info.present_mode_compat_group.data();
@@ -1474,14 +2546,49 @@ static bool init_surface_info(Device &device, WSIPlatform &platform,
 
 	info.present_mode.presentMode = swapchain_present_mode;
 
+	if (ext.image_compression_control_swapchain_features.imageCompressionControlSwapchain &&
+	    compression.type != VK_IMAGE_COMPRESSION_DEFAULT_EXT)
+	{
+		// There is no VU that we cannot just pass in whatever we want here,
+		// but we might not be honored if we pass in something unsupported.
+		// That's fine for now.
+		info.compression_control = { VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT };
+		info.compression_control.pNext = info.swapchain_pnext;
+		info.compression_control.flags = compression.type;
+		if (compression.type == VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT)
+		{
+			info.compression_control_fixed_rates = compression.fixed_rates;
+			info.compression_control.pFixedRateFlags = &info.compression_control_fixed_rates;
+			info.compression_control.compressionControlPlaneCount = 1;
+			LOGI("Using fixed-rate compression for swapchain (flags #%08x).\n", compression.fixed_rates);
+		}
+		else if (compression.type == VK_IMAGE_COMPRESSION_FIXED_RATE_DEFAULT_EXT)
+			LOGI("Using default fixed-rate compression for swapchain.\n");
+		else if (compression.type == VK_IMAGE_COMPRESSION_DISABLED_EXT)
+			LOGI("Disabling compression for swapchain.\n");
+
+		info.swapchain_pnext = &info.compression_control;
+	}
+
+	if (ext.supports_low_latency2_nv)
+	{
+		info.latency_create_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV };
+		info.latency_create_info.latencyModeEnable = VK_TRUE;
+		info.latency_create_info.pNext = info.swapchain_pnext;
+		info.swapchain_pnext = &info.latency_create_info;
+	}
+
 	return true;
 }
 
 WSI::SwapchainError WSI::init_swapchain(unsigned width, unsigned height)
 {
 	SurfaceInfo surface_info = {};
-	if (!init_surface_info(*device, *platform, surface, current_backbuffer_format, current_present_mode, surface_info, low_latency_mode_enable))
+	if (!init_surface_info(*device, *platform, surface, current_backbuffer_format, current_compression,
+	                       current_present_mode, surface_info, low_latency_mode_enable_present))
+	{
 		return SwapchainError::Error;
+	}
 	const auto &caps = surface_info.surface_capabilities;
 
 	// Happens on Windows when you minimize a window.
@@ -1506,8 +2613,10 @@ WSI::SwapchainError WSI::init_swapchain(unsigned width, unsigned height)
 
 	if (surface_format.format == VK_FORMAT_UNDEFINED &&
 	    (attempt_backbuffer_format == BackbufferFormat::HDR10 ||
+	     attempt_backbuffer_format == BackbufferFormat::scRGB ||
 	     attempt_backbuffer_format == BackbufferFormat::DisplayP3 ||
-	     attempt_backbuffer_format == BackbufferFormat::UNORMPassthrough))
+	     attempt_backbuffer_format == BackbufferFormat::UNORMPassthrough ||
+	     attempt_backbuffer_format == BackbufferFormat::Custom))
 	{
 		LOGW("Could not find suitable present format for HDR. Attempting fallback to UNORM.\n");
 		attempt_backbuffer_format = BackbufferFormat::UNORM;
@@ -1619,7 +2728,15 @@ WSI::SwapchainError WSI::init_swapchain(unsigned width, unsigned height)
 	    std::max(std::min(height, caps.maxImageExtent.height), caps.minImageExtent.height);
 
 	uint32_t desired_swapchain_images =
-		low_latency_mode_enable && current_present_mode == PresentMode::SyncToVBlank ? 2 : 3;
+		low_latency_mode_enable_present && current_present_mode == PresentMode::SyncToVBlank ? 2 : 3;
+
+	supports_present_wait2 =
+	    surface_info.present_id2.presentId2Supported && surface_info.present_wait2.presentWait2Supported;
+
+	// Need a deeper swapchain to avoid potential stalls when duping frames.
+	// We only do this when present wait is supported, so latency should not be compromised.
+	if (current_frame_dupe_aware && (device->get_device_features().present_wait_features.presentWait || supports_present_wait2))
+		desired_swapchain_images = current_frame_dupe_target_images;
 
 	desired_swapchain_images = Util::get_environment_uint("GRANITE_VULKAN_SWAPCHAIN_IMAGES", desired_swapchain_images);
 	LOGI("Targeting %u swapchain images.\n", desired_swapchain_images);
@@ -1663,19 +2780,72 @@ WSI::SwapchainError WSI::init_swapchain(unsigned width, unsigned height)
 
 	// Defer the deletion instead.
 	if (device->get_device_features().swapchain_maintenance1_features.swapchainMaintenance1 &&
-	    old_swapchain != VK_NULL_HANDLE)
+	    old_swapchain != VK_NULL_HANDLE && !device->get_workarounds().broken_present_fence)
 	{
 		deferred_swapchains.push_back({ old_swapchain, last_present_fence });
 		old_swapchain = VK_NULL_HANDLE;
 	}
 
 	platform->event_swapchain_destroyed();
+
+	supports_present_timing.feedback = surface_info.present_timing.presentTimingSupported ?
+			surface_info.present_timing.presentStageQueries : 0;
+
+	// Only ackknowledge present stages we understand in case there are future extensions.
+	supports_present_timing.feedback &=
+			VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT |
+			VK_PRESENT_STAGE_REQUEST_DEQUEUED_BIT_EXT |
+			VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT |
+			VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT;
+
+	supports_present_timing.absolute = surface_info.present_timing.presentTimingSupported &&
+	                                   surface_info.present_timing.presentAtAbsoluteTimeSupported;
+
+	supports_present_timing.relative = surface_info.present_timing.presentTimingSupported &&
+	                                   surface_info.present_timing.presentAtRelativeTimeSupported;
+
+	if (supports_present_wait2)
+		info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+	else
+		supports_present_timing.feedback = 0;
+
+	if (supports_present_timing.feedback)
+	{
+		info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+		LOGI("Enabling present timing, queries #%x, absolute %u, relative %u.\n",
+		     supports_present_timing.feedback,
+		     supports_present_timing.absolute,
+		     supports_present_timing.relative);
+	}
+
 	auto res = table->vkCreateSwapchainKHR(context->get_device(), &info, nullptr, &swapchain);
+	if (res < 0)
+		swapchain = VK_NULL_HANDLE;
+
+	if (res == VK_SUCCESS && supports_present_timing.feedback)
+	{
+		table->vkSetSwapchainPresentTimingQueueSizeEXT(context->get_device(), swapchain, PresentTimingQueueSize);
+		present_timing = {};
+		update_present_timing_properties();
+		update_time_domain_properties();
+		recalibrate_present_timing_domains();
+	}
+
 	platform->destroy_swapchain_resources(old_swapchain);
 	table->vkDestroySwapchainKHR(context->get_device(), old_swapchain, nullptr);
 	has_acquired_swapchain_index = false;
-	present_id = 0;
+	next_present_id = 1;
 	present_last_id = 0;
+	device->set_present_id(VK_NULL_HANDLE, 0);
+
+	if (res == VK_SUCCESS && device->get_device_features().supports_low_latency2_nv)
+	{
+		VkLatencySleepModeInfoNV sleep_mode_info = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV };
+		sleep_mode_info.lowLatencyBoost = low_latency_mode_enable_gpu_submit;
+		sleep_mode_info.lowLatencyMode = low_latency_mode_enable_gpu_submit;
+		if (table->vkSetLatencySleepModeNV(context->get_device(), swapchain, &sleep_mode_info) != VK_SUCCESS)
+			LOGE("Failed to set low latency sleep mode.\n");
+	}
 
 	active_present_mode = info.presentMode;
 	present_mode_compat_group = std::move(surface_info.present_mode_compat_group);
@@ -1723,7 +2893,7 @@ WSI::SwapchainError WSI::init_swapchain(unsigned width, unsigned height)
 	                                  swapchain_current_prerotate);
 
 	if (swapchain_surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
-	    device->get_device_features().supports_hdr_metadata)
+	    valid_hdr_metadata && device->get_device_features().supports_hdr_metadata)
 	{
 		table->vkSetHdrMetadataEXT(device->get_device(), 1, &swapchain, &hdr_metadata);
 	}
@@ -1761,5 +2931,7 @@ void WSIPlatform::destroy_swapchain_resources(VkSwapchainKHR) {}
 void WSIPlatform::event_frame_tick(double, double) {}
 void WSIPlatform::event_swapchain_index(Device *, unsigned) {}
 void WSIPlatform::begin_drop_event() {}
+void WSIPlatform::begin_soft_keyboard(const std::string &) {}
+void WSIPlatform::end_soft_keyboard() {}
 void WSIPlatform::show_message_box(const std::string &, Vulkan::WSIPlatform::MessageType) {}
 }

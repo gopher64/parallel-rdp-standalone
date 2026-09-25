@@ -434,10 +434,10 @@ Vulkan::ImageHandle VideoInterface::vram_fetch_stage(const Registers &regs, unsi
 
 	rt_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	rt_info.layout = Vulkan::ImageLayout::General;
 	rt_info.misc = Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_GRAPHICS_BIT |
 	               Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_COMPUTE_BIT;
 	vram_image = device->create_image(rt_info);
-	vram_image->set_layout(Vulkan::Layout::General);
 
 	async_cmd->image_barrier(*vram_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
 	                         0, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);

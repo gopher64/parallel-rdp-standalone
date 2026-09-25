@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -23,6 +23,7 @@
 #pragma once
 
 #include "aligned_alloc.hpp"
+#include <string.h>
 #include <memory>
 #include <algorithm>
 #include <type_traits>
@@ -37,20 +38,28 @@ public:
 	static_assert(std::is_trivially_default_constructible<T>::value, "T must be trivially constructible.");
 	static_assert(std::is_trivially_destructible<T>::value, "T must be trivially destructible.");
 
-	inline void reserve(size_t n)
+	void reserve(size_t n)
 	{
 		if (n > N)
 		{
-			buffer.reset(static_cast<T *>(memalign_alloc(std::max<size_t>(64, alignof(T)), n * sizeof(T))));
+			n = std::max<size_t>(n, N * 3 / 2);
+
+			auto *new_ptr = static_cast<T *>(
+				memalign_alloc(std::max<size_t>(64, alignof(T)), n * sizeof(T)));
+
+			if (buffer)
+				memcpy(new_ptr, buffer.get(), N * sizeof(T));
+
+			buffer.reset(new_ptr);
 			N = n;
 		}
 	}
 
-	inline T &operator[](size_t index) { return buffer.get()[index]; }
-	inline const T &operator[](size_t index) const { return buffer.get()[index]; }
-	inline T *data() { return buffer.get(); }
-	inline const T *data() const { return buffer.get(); }
-	inline size_t get_capacity() const { return N; }
+	T &operator[](size_t index) { return buffer.get()[index]; }
+	const T &operator[](size_t index) const { return buffer.get()[index]; }
+	T *data() { return buffer.get(); }
+	const T *data() const { return buffer.get(); }
+	size_t get_capacity() const { return N; }
 
 private:
 	std::unique_ptr<T, AlignedDeleter> buffer;

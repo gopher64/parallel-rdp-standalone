@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -39,6 +39,8 @@
 #include "query_pool.hpp"
 #include "buffer_pool.hpp"
 #include "indirect_layout.hpp"
+#include "pipeline_cache.hpp"
+#include "breadcrumbs.hpp"
 #include <memory>
 #include <vector>
 #include <functional>
@@ -80,15 +82,24 @@ enum class SwapchainRenderPass
 	DepthStencil
 };
 
+struct HostReference
+{
+	const void *data;
+	size_t size;
+};
+
 struct InitialImageBuffer
 {
+	// Either buffer or host is used. Ideally host is used so that host image copy can be used for uploads.
 	BufferHandle buffer;
+	HostReference host;
 	Util::SmallVector<VkBufferImageCopy, 32> blits;
 };
 
 struct HandlePool
 {
 	VulkanObjectPool<Buffer> buffers;
+	VulkanObjectPool<RTAS> rtas;
 	VulkanObjectPool<Image> images;
 	VulkanObjectPool<LinearHostImage> linear_images;
 	VulkanObjectPool<ImageView> image_views;
@@ -129,7 +140,7 @@ class BatchComposer
 public:
 	enum { MaxSubmissions = 8 };
 
-	BatchComposer();
+	explicit BatchComposer(uint64_t present_id_nv);
 	void add_wait_submissions(WaitSemaphores &sem);
 	void add_wait_semaphore(SemaphoreHolder &sem, VkPipelineStageFlags2 stage);
 	void add_wait_semaphore(VkSemaphore sem, VkPipelineStageFlags2 stage);
@@ -143,13 +154,28 @@ private:
 	Util::SmallVector<VkSubmitInfo2, MaxSubmissions> submits;
 	VkPerformanceQuerySubmitInfoKHR profiling_infos[Helper::BatchComposer::MaxSubmissions];
 
+	Util::SmallVector<VkLatencySubmissionPresentIdNV> present_ids_nv;
 	Util::SmallVector<VkSemaphoreSubmitInfo> waits[MaxSubmissions];
 	Util::SmallVector<VkSemaphoreSubmitInfo> signals[MaxSubmissions];
 	Util::SmallVector<VkCommandBufferSubmitInfo> cmds[MaxSubmissions];
 
+	uint64_t present_id_nv = 0;
 	unsigned submit_index = 0;
 };
 }
+
+struct ContextOptions
+{
+	// Enabled by default.
+	// Disabling may improve memory usage a bit since more allocations get to share the same
+	// VkDeviceMemory.
+	bool memory_priorities = true;
+
+	// In this mode, expect smaller and fewer allocations.
+	// Avoid allocating large blocks in the memory allocator.
+	// Used to save memory.
+	bool lean_memory_mode = false;
+};
 
 class Device
 	: public Util::IntrusivePtrEnabled<Device, std::default_delete<Device>, HandleCounter>
@@ -174,6 +200,8 @@ public:
 	friend class ImmutableYcbcrConversion;
 	friend class Buffer;
 	friend struct BufferDeleter;
+	friend class RTAS;
+	friend struct RTASDeleter;
 	friend class BufferView;
 	friend struct BufferViewDeleter;
 	friend class ImageView;
@@ -208,6 +236,8 @@ public:
 
 	// Only called by main thread, during setup phase.
 	void set_context(const Context &context);
+	void set_context(const Context &context, const ContextOptions &options);
+	const ContextOptions &get_context_options() const { return context_options; }
 
 	// This is asynchronous in nature. See query_initialization_progress().
 	// Kicks off Fossilize and shader manager caching.
@@ -216,7 +246,7 @@ public:
 	void wait_shader_caches();
 
 	void init_swapchain(const std::vector<VkImage> &swapchain_images, unsigned width, unsigned height, VkFormat format,
-	                    VkSurfaceTransformFlagBitsKHR transform, VkImageUsageFlags usage);
+	                    VkSurfaceTransformFlagBitsKHR transform, VkImageUsageFlags usage, VkImageLayout layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 	void set_swapchain_queue_family_support(uint32_t queue_family_support);
 	bool can_touch_swapchain_in_command_buffer(CommandBuffer::Type type) const;
 	void init_external_swapchain(const std::vector<ImageHandle> &swapchain_images);
@@ -241,10 +271,13 @@ public:
 
 	size_t get_pipeline_cache_size();
 	bool get_pipeline_cache_data(uint8_t *data, size_t size);
-	bool init_pipeline_cache(const uint8_t *data, size_t size);
+	// If persistent_mapping is true, the data pointer lifetime is live as long as the device is.
+	// Useful for read-only file mmap.
+	bool init_pipeline_cache(const uint8_t *data, size_t size, bool persistent_mapping = false);
 
 	// Frame-pushing interface.
 	void next_frame_context();
+	bool next_frame_context_is_non_blocking();
 
 	// Normally, the main thread ensures forward progress of the frame context
 	// so that async tasks don't have to care about it,
@@ -274,6 +307,8 @@ public:
 	void flush_frame();
 	CommandBufferHandle request_command_buffer(CommandBuffer::Type type = CommandBuffer::Type::Generic);
 	CommandBufferHandle request_command_buffer_for_thread(unsigned thread_index, CommandBuffer::Type type = CommandBuffer::Type::Generic);
+	// Must be given back with submit_discard().
+	CommandBufferHandle request_borrowed_command_buffer(VkCommandBuffer cmd);
 
 	CommandBufferHandle request_profiled_command_buffer(CommandBuffer::Type type = CommandBuffer::Type::Generic);
 	CommandBufferHandle request_profiled_command_buffer_for_thread(unsigned thread_index, CommandBuffer::Type type = CommandBuffer::Type::Generic);
@@ -290,7 +325,7 @@ public:
 	void submit_discard(CommandBufferHandle &cmd);
 	QueueIndices get_physical_queue_type(CommandBuffer::Type queue_type) const;
 	void register_time_interval(std::string tid, QueryPoolHandle start_ts, QueryPoolHandle end_ts,
-	                            const std::string &tag);
+	                            const std::string &tag, uint64_t counter = 0);
 
 	// Request shaders and programs. These objects are owned by the Device.
 	Shader *request_shader(const uint32_t *code, size_t size, const ResourceLayout *layout = nullptr);
@@ -310,7 +345,7 @@ public:
 	Program *request_program(Shader *task, Shader *mesh, Shader *fragment, const ImmutableSamplerBank *sampler_bank = nullptr);
 	Program *request_program(Shader *vertex, Shader *fragment, const ImmutableSamplerBank *sampler_bank = nullptr);
 	Program *request_program(Shader *compute, const ImmutableSamplerBank *sampler_bank = nullptr);
-	const IndirectLayout *request_indirect_layout(const IndirectLayoutToken *tokens,
+	const IndirectLayout *request_indirect_layout(const PipelineLayout *layout, const IndirectLayoutToken *tokens,
 	                                              uint32_t num_tokens, uint32_t stride);
 
 	const ImmutableYcbcrConversion *request_immutable_ycbcr_conversion(const VkSamplerYcbcrConversionCreateInfo &info);
@@ -331,14 +366,29 @@ public:
 	ImageHandle create_image(const ImageCreateInfo &info, const ImageInitialData *initial = nullptr);
 	ImageHandle create_image_from_staging_buffer(const ImageCreateInfo &info, const InitialImageBuffer *buffer);
 	LinearHostImageHandle create_linear_host_image(const LinearHostImageCreateInfo &info);
+	BufferHandle wrap_buffer(const BufferCreateInfo &info, VkBuffer buffer, bool supports_bda = true);
 	// Does not create any default image views. Only wraps the VkImage
 	// as a non-owned handle for purposes of API interop.
 	ImageHandle wrap_image(const ImageCreateInfo &info, VkImage img);
 	DeviceAllocationOwnerHandle take_device_allocation_ownership(Image &image);
 	DeviceAllocationOwnerHandle allocate_memory(const MemoryAllocateInfo &info);
 
+	// If cmd is not null, the RTAS is immediately built.
+	// If compacted_size is not null, a compacted size query will be made. info.mode must be compatible with compaction.
+	RTASHandle create_rtas(const BottomRTASCreateInfo &info, CommandBuffer *cmd, QueryPoolHandle *compacted_size);
+	RTASHandle create_rtas(const TopRTASCreateInfo &info, CommandBuffer *cmd);
+	// Generic creation methods.
+	RTASHandle create_rtas(VkAccelerationStructureTypeKHR type, VkDeviceSize size);
+	RTASHandle create_rtas(VkAccelerationStructureTypeKHR type, BufferHandle buffer, VkDeviceSize offset, VkDeviceSize size);
+
 	// Create staging buffers for images.
+
+	// This is deprecated and considered slow path.
+	// If number of subresources is 1, the fast path can be taken.
 	InitialImageBuffer create_image_staging_buffer(const ImageCreateInfo &info, const ImageInitialData *initial);
+
+	// Only takes a reference to the layout.
+	// Ideal path when uploading resources since it's compatible with host image copy, etc.
 	InitialImageBuffer create_image_staging_buffer(const TextureFormatLayout &layout);
 
 	// Create image view, buffer views and samplers.
@@ -439,6 +489,7 @@ public:
 	// in query_initialization_progress().
 	ShaderManager &get_shader_manager();
 	ResourceManager &get_resource_manager();
+	Granite::FileMappingHandle persistent_pipeline_cache;
 #endif
 
 	// Useful for loading screens or otherwise figuring out
@@ -487,6 +538,7 @@ public:
 	bool swapchain_touched() const;
 
 	double convert_device_timestamp_delta(uint64_t start_ticks, uint64_t end_ticks) const;
+	int64_t convert_timestamp_to_absolute_nsec(const QueryPoolResult &handle);
 	// Writes a timestamp on host side, which is calibrated to the GPU timebase.
 	QueryPoolHandle write_calibrated_timestamp();
 
@@ -516,6 +568,7 @@ private:
 	VkDevice device = VK_NULL_HANDLE;
 	const VolkDeviceTable *table = nullptr;
 	const Context *ctx = nullptr;
+	ContextOptions context_options = {};
 	QueueInfo queue_info;
 	unsigned num_thread_indices = 1;
 
@@ -533,6 +586,7 @@ private:
 	QueryPoolHandle write_timestamp(VkCommandBuffer cmd, VkPipelineStageFlags2 stage);
 
 	void set_acquire_semaphore(unsigned index, Semaphore acquire);
+	void set_present_id(VkSwapchainKHR low_latency_swapchain, uint64_t present_id);
 	Semaphore consume_release_semaphore();
 	VkQueue get_current_present_queue() const;
 	CommandBuffer::Type get_current_present_queue_type() const;
@@ -556,20 +610,18 @@ private:
 	void deinit_timeline_semaphores();
 
 	uint64_t update_wrapped_device_timestamp(uint64_t ts);
-	int64_t convert_timestamp_to_absolute_nsec(const QueryPoolResult &handle);
 	Context::SystemHandles system_handles;
 
 	QueryPoolHandle write_timestamp_nolock(VkCommandBuffer cmd, VkPipelineStageFlags2 stage);
 	QueryPoolHandle write_calibrated_timestamp_nolock();
 	void register_time_interval_nolock(std::string tid, QueryPoolHandle start_ts, QueryPoolHandle end_ts,
-	                                   const std::string &tag);
+	                                   const std::string &tag, uint64_t counter = 0);
 
 	// Make sure this is deleted last.
 	HandlePool handle_pool;
 
 	// Calibrated timestamps.
 	void init_calibrated_timestamps();
-	void recalibrate_timestamps_fallback();
 	void recalibrate_timestamps();
 	bool resample_calibrated_timestamps();
 	VkTimeDomainEXT calibrated_time_domain = VK_TIME_DOMAIN_DEVICE_EXT;
@@ -587,6 +639,8 @@ private:
 		EventManager event;
 		BufferPool vbo, ibo, ubo, staging;
 		TimestampIntervalManager timestamps;
+		DescriptorBufferAllocator descriptor_buffer;
+		BreadcrumbsTracker breadcrumbs;
 	};
 	Managers managers;
 
@@ -607,6 +661,7 @@ private:
 		void operator=(const PerFrame &) = delete;
 		PerFrame(const PerFrame &) = delete;
 
+		bool wait(uint64_t timeout);
 		void begin();
 		void trim_command_pools();
 
@@ -619,7 +674,7 @@ private:
 		VkSemaphore timeline_semaphores[QUEUE_INDEX_COUNT] = {};
 		uint64_t timeline_fences[QUEUE_INDEX_COUNT] = {};
 
-		QueryPool query_pool;
+		QueryPool query_pool_ts, query_pool_rtas;
 
 		std::vector<BufferBlock> vbo_blocks;
 		std::vector<BufferBlock> ibo_blocks;
@@ -631,16 +686,21 @@ private:
 		std::vector<DeviceAllocation> allocations;
 		std::vector<VkFramebuffer> destroyed_framebuffers;
 		std::vector<VkSampler> destroyed_samplers;
-		std::vector<VkImageView> destroyed_image_views;
-		std::vector<VkBufferView> destroyed_buffer_views;
+		std::vector<CachedImageView> destroyed_image_views;
+		std::vector<CachedBufferView> destroyed_buffer_views;
 		std::vector<VkImage> destroyed_images;
 		std::vector<VkBuffer> destroyed_buffers;
+		std::vector<VkAccelerationStructureKHR> destroyed_rtas;
 		std::vector<VkDescriptorPool> destroyed_descriptor_pools;
 		Util::SmallVector<CommandBufferHandle> submissions[QUEUE_INDEX_COUNT];
 		std::vector<VkSemaphore> recycled_semaphores;
 		std::vector<VkEvent> recycled_events;
 		std::vector<VkSemaphore> destroyed_semaphores;
 		std::vector<VkSemaphore> consumed_semaphores;
+		std::vector<VkIndirectExecutionSetEXT> destroyed_execution_sets;
+		std::vector<DescriptorBufferAllocation> descriptor_buffer_allocs;
+		std::vector<CachedDescriptorPayload> cached_descriptor_payloads;
+		std::vector<BufferMarkerHandle> breadcrumbs;
 
 		struct DebugChannel
 		{
@@ -656,6 +716,7 @@ private:
 			QueryPoolHandle start_ts;
 			QueryPoolHandle end_ts;
 			TimestampInterval *timestamp_tag;
+			uint64_t counter;
 		};
 		std::vector<TimestampIntervalHandles> timestamp_intervals;
 
@@ -675,6 +736,13 @@ private:
 		uint32_t queue_family_support_mask = 0;
 		unsigned index = 0;
 		bool consumed = false;
+
+		struct
+		{
+			uint64_t present_id;
+			bool need_submit_begin_marker;
+			VkSwapchainKHR swapchain;
+		} low_latency = {};
 	} wsi;
 	bool can_touch_swapchain_in_command_buffer(QueueIndices physical_type) const;
 
@@ -687,6 +755,8 @@ private:
 		VkSemaphore timeline_semaphore = VK_NULL_HANDLE;
 		uint64_t current_timeline = 0;
 		PerformanceQueryPool performance_query_pool;
+		uint32_t implicit_sync_to_queues = 0;
+		uint32_t has_incoming_queue_dependencies = 0;
 	} queue_data[QUEUE_INDEX_COUNT];
 
 	struct InternalFence
@@ -737,19 +807,18 @@ private:
 
 	FramebufferAllocator framebuffer_allocator;
 	TransientAttachmentAllocator transient_allocator;
-	VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+	VkPipelineCache legacy_pipeline_cache = VK_NULL_HANDLE;
+	PipelineCache pipeline_binary_cache;
 
 	void init_pipeline_cache();
 	void flush_pipeline_cache();
 
 	PerformanceQueryPool &get_performance_query_pool(QueueIndices physical_type);
-	void clear_wait_semaphores();
-	void submit_staging(CommandBufferHandle &cmd, bool flush);
 	PipelineEvent request_pipeline_event();
 
 	std::function<void ()> queue_lock_callback;
 	std::function<void ()> queue_unlock_callback;
-	void flush_frame(QueueIndices physical_type);
+	void flush_frame_nolock(QueueIndices physical_type);
 	void submit_empty_inner(QueueIndices type, InternalFence *fence,
 	                        SemaphoreHolder *external_semaphore,
 	                        unsigned semaphore_count,
@@ -760,14 +829,16 @@ private:
 	                        SemaphoreHolder *external_semaphore,
 	                        VkSemaphore sem, uint64_t timeline, InternalFence *fence,
 	                        unsigned semaphore_count, Semaphore *semaphores);
+	void emit_implicit_sync_to_queues(QueueIndices physical_type);
 	VkResult submit_batches(Helper::BatchComposer &composer, VkQueue queue, VkFence fence,
 	                        int profiling_iteration = -1);
 	VkResult queue_submit(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence);
 
 	void destroy_buffer(VkBuffer buffer);
+	void destroy_rtas(VkAccelerationStructureKHR rtas);
 	void destroy_image(VkImage image);
-	void destroy_image_view(VkImageView view);
-	void destroy_buffer_view(VkBufferView view);
+	void destroy_image_view(const CachedImageView &view);
+	void destroy_buffer_view(const CachedBufferView &view);
 	void destroy_sampler(VkSampler sampler);
 	void destroy_framebuffer(VkFramebuffer framebuffer);
 	void destroy_semaphore(VkSemaphore semaphore);
@@ -777,11 +848,15 @@ private:
 	void free_memory(const DeviceAllocation &alloc);
 	void reset_fence(VkFence fence, bool observed_wait);
 	void destroy_descriptor_pool(VkDescriptorPool desc_pool);
+	void destroy_indirect_execution_set(VkIndirectExecutionSetEXT exec_set);
+	void free_descriptor_buffer_allocation(const DescriptorBufferAllocation &alloc);
+	void free_cached_descriptor_payload(const CachedDescriptorPayload &payload);
 
 	void destroy_buffer_nolock(VkBuffer buffer);
+	void destroy_rtas_nolock(VkAccelerationStructureKHR rtas);
 	void destroy_image_nolock(VkImage image);
-	void destroy_image_view_nolock(VkImageView view);
-	void destroy_buffer_view_nolock(VkBufferView view);
+	void destroy_image_view_nolock(const CachedImageView &view);
+	void destroy_buffer_view_nolock(const CachedBufferView &view);
 	void destroy_sampler_nolock(VkSampler sampler);
 	void destroy_framebuffer_nolock(VkFramebuffer framebuffer);
 	void destroy_semaphore_nolock(VkSemaphore semaphore);
@@ -791,10 +866,14 @@ private:
 	void free_memory_nolock(const DeviceAllocation &alloc);
 	void destroy_descriptor_pool_nolock(VkDescriptorPool desc_pool);
 	void reset_fence_nolock(VkFence fence, bool observed_wait);
+	void destroy_indirect_execution_set_nolock(VkIndirectExecutionSetEXT exec_set);
+	void free_descriptor_buffer_allocation_nolock(const DescriptorBufferAllocation &alloc);
+	void free_cached_descriptor_payload_nolock(const CachedDescriptorPayload &payload);
 
 	void flush_frame_nolock();
 	CommandBufferHandle request_command_buffer_nolock(unsigned thread_index, CommandBuffer::Type type, bool profiled);
 	void submit_discard_nolock(CommandBufferHandle &cmd);
+	void submit_and_sync_to_queues(CommandBufferHandle &cmd, uint32_t sync_to_queues);
 	void submit_nolock(CommandBufferHandle cmd, Fence *fence,
 	                   unsigned semaphore_count, Semaphore *semaphore);
 	void submit_empty_nolock(QueueIndices physical_type, Fence *fence,
@@ -825,7 +904,7 @@ private:
 #ifdef GRANITE_VULKAN_SYSTEM_HANDLES
 	ShaderManager shader_manager;
 	ResourceManager resource_manager;
-	void init_shader_manager_cache();
+	void init_shader_manager_cache(Granite::TaskGroup *shader_compilation_group);
 	void flush_shader_manager_cache();
 #endif
 
@@ -876,7 +955,7 @@ private:
 	void fill_buffer_sharing_indices(VkBufferCreateInfo &create_info, uint32_t *sharing_indices);
 
 	bool allocate_image_memory(DeviceAllocation *allocation, const ImageCreateInfo &info,
-	                           VkImage image, VkImageTiling tiling);
+	                           VkImage image, VkImageTiling tiling, VkImageUsageFlags usage);
 
 	void promote_read_write_caches_to_read_only();
 };

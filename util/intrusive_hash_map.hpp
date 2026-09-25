@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Hans-Kristian Arntzen
+/* Copyright (c) 2017-2026 Hans-Kristian Arntzen
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -661,6 +661,11 @@ public:
 	}
 
 	IntrusiveHashMapHolder<T> &get_read_only()
+	{
+		return read_only;
+	}
+
+	const IntrusiveHashMapHolder<T> &get_read_only() const
 	{
 		return read_only;
 	}

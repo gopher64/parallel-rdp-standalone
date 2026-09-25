@@ -27,6 +27,11 @@
 
 ivec4 special_expand(ivec4 value)
 {
+	return bitfieldExtract(value - 0x80, 0, 9) + 0x80;
+}
+
+ivec3 special_expand(ivec3 value)
+{
 	// Special sign-extend without explicit clamp.
 	return bitfieldExtract(value - 0x80, 0, 9) + 0x80;
 }
@@ -44,6 +49,16 @@ i16x4 combiner_equation(ivec4 a, ivec4 b, ivec4 c, ivec4 d)
 	ivec4 color = (a - b) * c;
 	color += 0x80;
 	return i16x4(color >> 8) + i16x4(d);
+}
+
+ivec3 combiner_accumulator(ivec3 a, ivec3 b, ivec3 c, ivec3 d)
+{
+	c = bitfieldExtract(c, 0, 9);
+	a = special_expand(a);
+	b = special_expand(b);
+	d = special_expand(d);
+
+	return ((a - b) * c + (d << 8) + 0x80) & 0x1ffff;
 }
 
 struct CombinerInputs
@@ -211,6 +226,16 @@ ivec4 select_add(CombinerInputs inputs, int selector_rgb, int selector_alpha)
 	return ivec4(res, alpha);
 }
 
+int chroma_key_alpha(ivec3 accumulator, u16x4 key_width)
+{
+	ivec3 dist = bitfieldExtract(accumulator, 0, 17);
+
+	ivec3 bias = 0x10 * ivec3(greaterThan(dist, ivec3(0))) * ivec3(equal(dist & 0xf, ivec3(8)));
+
+	ivec3 key = (ivec3(key_width.rgb) << 4) - abs(dist) + bias;
+	return clamp(min(key.r, min(key.g, key.b)), 0, 0xff);
+}
+
 i16x4 combiner_cycle0(CombinerInputs inputs, u8x4 combiner_inputs_rgb, u8x4 combiner_inputs_alpha, int alpha_dith,
                       int coverage, bool cvg_times_alpha, bool alpha_cvg_select, bool alpha_test, out u8 alpha_test_reference)
 {
@@ -248,7 +273,8 @@ i16x4 combiner_cycle0(CombinerInputs inputs, u8x4 combiner_inputs_rgb, u8x4 comb
 }
 
 i16x4 combiner_cycle1(CombinerInputs inputs, u8x4 combiner_inputs_rgb, u8x4 combiner_inputs_alpha, int alpha_dith,
-		              inout int coverage, bool cvg_times_alpha, bool alpha_cvg_select)
+		              inout int coverage, bool cvg_times_alpha, bool alpha_cvg_select,
+		              bool key_en, u16x4 key_width)
 {
 	ivec4 muladd = select_muladd(inputs, combiner_inputs_rgb.x, combiner_inputs_alpha.x);
 	ivec4 mulsub = select_mulsub(inputs, combiner_inputs_rgb.y, combiner_inputs_alpha.y);
@@ -258,6 +284,13 @@ i16x4 combiner_cycle1(CombinerInputs inputs, u8x4 combiner_inputs_rgb, u8x4 comb
 	i16x4 combined = combiner_equation(muladd, mulsub, mul, add);
 
 	combined = clamp_9bit_notrunc(combined);
+
+	int key_alpha = 0;
+	if (key_en)
+	{
+		key_alpha = chroma_key_alpha(combiner_accumulator(muladd.rgb, mulsub.rgb, mul.rgb, add.rgb), key_width);
+		combined.rgb = clamp_9bit_notrunc(ivec4(muladd.rgb, 0)).rgb;
+	}
 
 	// Expands 0xff to 0x100 to avoid having to divide by 2**n - 1.
 	int expanded_alpha = combined.a + ((combined.a + 1) >> 8);
@@ -273,6 +306,8 @@ i16x4 combiner_cycle1(CombinerInputs inputs, u8x4 combiner_inputs_rgb, u8x4 comb
 
 	if (alpha_cvg_select)
 		expanded_alpha = modulated_alpha;
+	else if (key_en)
+		expanded_alpha = key_alpha;
 	else
 		expanded_alpha += alpha_dith;
 

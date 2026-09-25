@@ -33,7 +33,6 @@ The implementation is quite complete, and compatibility is very high in the limi
 However, not every single feature is supported at this moment.
 Ticking the last boxes depends mostly on real content making use of said features.
 
-- Color combiner chroma keying
 - Various "bugs" / questionable behavior that seems meaningless to emulate
 - Certain extreme edge cases in TMEM upload. The implementation has tests for many "crazy" edge cases though.
 - ... possibly other obscure features
