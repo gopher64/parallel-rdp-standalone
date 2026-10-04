@@ -907,7 +907,8 @@ void Device::init_workarounds()
 		workarounds.broken_pipeline_cache_control = true;
 	}
 
-	if (ext.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
+	if (ext.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+	    ext.driver_id == VK_DRIVER_ID_MESA_TURNIP)
 		workarounds.broken_present_fence = true;
 #endif
 
