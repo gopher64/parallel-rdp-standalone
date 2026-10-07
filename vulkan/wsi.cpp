@@ -1721,7 +1721,12 @@ bool WSI::end_frame()
 #endif
 
 		auto release = device->consume_release_semaphore();
-		VK_ASSERT(release);
+		// Can be null if acquire failed, e.g. the Android surface was destroyed mid-frame.
+		if (!release)
+		{
+			LOGE("No release semaphore for present, skipping.\n");
+			return false;
+		}
 		VK_ASSERT(release->is_signalled());
 		VK_ASSERT(!release->is_pending_wait());
 

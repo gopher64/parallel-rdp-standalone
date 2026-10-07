@@ -2032,6 +2032,13 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 	if ((flags & CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT) == 0)
 		ext.vk14_features.pushDescriptor = VK_FALSE;
 
+	// Mali proprietary driver crashes in vkCmdPushDescriptorSetWithTemplate (seen on Mali-G715, driver 54.3.0).
+	if (gpu_props.vendorID == VENDOR_ID_ARM && ext.vk14_features.pushDescriptor)
+	{
+		LOGW("Disabling push descriptors on ARM proprietary driver.\n");
+		ext.vk14_features.pushDescriptor = VK_FALSE;
+	}
+
 	ext.mesh_shader_features.primitiveFragmentShadingRateMeshShader = VK_FALSE;
 	ext.mesh_shader_features.meshShaderQueries = VK_FALSE;
 	ext.mesh_shader_features.multiviewMeshShader = VK_FALSE;
@@ -2190,6 +2197,24 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 #endif
 
 	vkGetPhysicalDeviceProperties2(gpu, &props);
+
+	// Decide on descriptor buffer usage before device creation (same criteria as supports_descriptor_buffer below).
+	// If we will not use it, do not enable the feature at all, since some code paths check the raw feature bit
+	// (e.g. descriptor update templates are only created when it is disabled).
+	if (ext.descriptor_buffer_features.descriptorBuffer)
+	{
+		auto max_heap_size = std::min<VkDeviceSize>(
+				ext.descriptor_buffer_properties.maxSamplerDescriptorBufferRange,
+				ext.descriptor_buffer_properties.maxResourceDescriptorBufferRange);
+
+		bool usable =
+				ext.descriptor_buffer_properties.samplerDescriptorSize * 512ull * 1024ull <= max_heap_size &&
+				ext.descriptor_buffer_properties.sampledImageDescriptorSize * 512ull * 1024ull <= max_heap_size &&
+				ext.descriptor_buffer_properties.combinedImageSamplerDescriptorSingleArray;
+
+		if (!usable)
+			ext.descriptor_buffer_features.descriptorBuffer = VK_FALSE;
+	}
 
 	// If a layer or driver doesn't tell us that internal cache is preferred,
 	// go ahead and take full control over the cache.
