@@ -1062,12 +1062,11 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 
 	vkGetPhysicalDeviceProperties(gpu, &gpu_props);
 
-	// Push descriptors and descriptor buffers are unreliable on ARM/Mali GPUs, so disable them there.
-	if (gpu_props.vendorID == VENDOR_ID_ARM)
-	{
-		LOGW("ARM/Mali GPU detected, disabling push descriptor and descriptor buffer support.\n");
-		flags &= ~(CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT | CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT);
-	}
+	// Push descriptors and descriptor buffers are unreliable on Android, so disable them there.
+#ifdef ANDROID
+	LOGW("ARM/Mali GPU detected, disabling push descriptor and descriptor buffer support.\n");
+	flags &= ~(CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT | CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT);
+#endif
 
 	// We can use core device functionality if enabled VkInstance apiVersion and physical device supports it.
 	ext.device_api_core_version = std::min(ext.instance_api_core_version, gpu_props.apiVersion);
