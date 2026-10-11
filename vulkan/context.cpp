@@ -1064,7 +1064,7 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 
 	// Push descriptors and descriptor buffers are unreliable on Android, so disable them there.
 #ifdef ANDROID
-	LOGW("ARM/Mali GPU detected, disabling push descriptor and descriptor buffer support.\n");
+	LOGW("Android detected, disabling push descriptor and descriptor buffer support.\n");
 	flags &= ~(CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT | CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT);
 #endif
 
