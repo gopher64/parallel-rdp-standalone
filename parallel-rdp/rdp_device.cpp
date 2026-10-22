@@ -471,6 +471,30 @@ void CommandProcessor::op_set_scissor(const uint32_t *words)
 	renderer.set_static_rasterization_state(static_state);
 }
 
+void CommandProcessor::save_render_state(RenderStateSnapshot &snapshot) const
+{
+	snapshot.scissor_state = scissor_state;
+	snapshot.static_state = static_state;
+	snapshot.depth_blend = depth_blend;
+	snapshot.texture_image_addr = texture_image.addr;
+	snapshot.texture_image_width = texture_image.width;
+	snapshot.texture_image_fmt = texture_image.fmt;
+	snapshot.texture_image_size = texture_image.size;
+	renderer.save_render_state(snapshot.renderer_state);
+}
+
+void CommandProcessor::load_render_state(const RenderStateSnapshot &snapshot)
+{
+	scissor_state = snapshot.scissor_state;
+	static_state = snapshot.static_state;
+	depth_blend = snapshot.depth_blend;
+	texture_image.addr = snapshot.texture_image_addr;
+	texture_image.width = snapshot.texture_image_width;
+	texture_image.fmt = snapshot.texture_image_fmt;
+	texture_image.size = snapshot.texture_image_size;
+	renderer.restore_render_state(snapshot.renderer_state);
+}
+
 void CommandProcessor::op_set_other_modes(const uint32_t *words)
 {
 	STATE_MASK(static_state.flags, bool(words[0] & (1 << 19)), RASTERIZATION_PERSPECTIVE_CORRECT_BIT);

@@ -709,6 +709,79 @@ void Renderer::set_depth_blend_state(const DepthBlendState &state)
 	stream.depth_blend_state = state;
 }
 
+void Renderer::save_render_state(RendererSavedState &state) const
+{
+	for (unsigned i = 0; i < Limits::MaxNumTiles; i++)
+		state.tiles[i] = tiles[i];
+
+	state.scissor_state = stream.scissor_state;
+	state.static_raster_state = stream.static_raster_state;
+	state.depth_blend_state = stream.depth_blend_state;
+
+	state.blend_color = constants.blend_color;
+	state.fog_color = constants.fog_color;
+	state.env_color = constants.env_color;
+	state.primitive_color = constants.primitive_color;
+	state.fill_color = constants.fill_color;
+	state.min_level = constants.min_level;
+	state.prim_lod_frac = constants.prim_lod_frac;
+	state.prim_depth = constants.prim_depth;
+	state.prim_dz = constants.prim_dz;
+	memcpy(state.convert, constants.convert, sizeof(state.convert));
+	memcpy(state.key_width, constants.key_width, sizeof(state.key_width));
+	memcpy(state.key_center, constants.key_center, sizeof(state.key_center));
+	memcpy(state.key_scale, constants.key_scale, sizeof(state.key_scale));
+	state.use_prim_depth = constants.use_prim_depth;
+
+	state.fb_addr = fb.addr;
+	state.fb_depth_addr = fb.depth_addr;
+	state.fb_width = fb.width;
+	state.fb_deduced_height = fb.deduced_height;
+	state.fb_fmt = fb.fmt;
+	state.fb_depth_write_pending = fb.depth_write_pending;
+	state.fb_color_write_pending = fb.color_write_pending;
+
+	state.base_primitive_index = base_primitive_index;
+}
+
+void Renderer::restore_render_state(const RendererSavedState &state)
+{
+	// Any work queued against the previous state must be flushed before swapping it out.
+	flush_queues();
+
+	for (unsigned i = 0; i < Limits::MaxNumTiles; i++)
+		tiles[i] = state.tiles[i];
+
+	stream.scissor_state = state.scissor_state;
+	stream.static_raster_state = state.static_raster_state;
+	stream.depth_blend_state = state.depth_blend_state;
+
+	constants.blend_color = state.blend_color;
+	constants.fog_color = state.fog_color;
+	constants.env_color = state.env_color;
+	constants.primitive_color = state.primitive_color;
+	constants.fill_color = state.fill_color;
+	constants.min_level = state.min_level;
+	constants.prim_lod_frac = state.prim_lod_frac;
+	constants.prim_depth = state.prim_depth;
+	constants.prim_dz = state.prim_dz;
+	memcpy(constants.convert, state.convert, sizeof(constants.convert));
+	memcpy(constants.key_width, state.key_width, sizeof(constants.key_width));
+	memcpy(constants.key_center, state.key_center, sizeof(constants.key_center));
+	memcpy(constants.key_scale, state.key_scale, sizeof(constants.key_scale));
+	constants.use_prim_depth = state.use_prim_depth;
+
+	fb.addr = state.fb_addr;
+	fb.depth_addr = state.fb_depth_addr;
+	fb.width = state.fb_width;
+	fb.deduced_height = state.fb_deduced_height;
+	fb.fmt = state.fb_fmt;
+	fb.depth_write_pending = state.fb_depth_write_pending;
+	fb.color_write_pending = state.fb_color_write_pending;
+
+	base_primitive_index = state.base_primitive_index;
+}
+
 void Renderer::draw_flat_primitive(TriangleSetup &setup)
 {
 	draw_shaded_primitive(setup, {});

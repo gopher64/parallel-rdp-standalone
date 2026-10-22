@@ -186,6 +186,23 @@ public:
 	// Must be called before scanout(), or all per-scanline register state is ignored for the scanout.
 	void end_vi_register_per_scanline();
 
+	// Persistent RDP render state (SET_* register state in the command processor and renderer)
+	// that must be captured in a savestate in addition to the command FIFO, TMEM and hidden RDRAM.
+	// POD so it can be memcpy'd into a savestate blob.
+	struct RenderStateSnapshot
+	{
+		ScissorState scissor_state;
+		StaticRasterizationState static_state;
+		DepthBlendState depth_blend;
+		uint32_t texture_image_addr;
+		uint32_t texture_image_width;
+		TextureFormat texture_image_fmt;
+		TextureSize texture_image_size;
+		RendererSavedState renderer_state;
+	};
+	void save_render_state(RenderStateSnapshot &snapshot) const;
+	void load_render_state(const RenderStateSnapshot &snapshot);
+
 	// Intended flow is something like:
 	// set_vi_register(reg, value0) // value0 used for line [0, 99]
 	// begin_vi_register_per_scanline(flags);

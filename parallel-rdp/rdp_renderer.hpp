@@ -46,6 +46,47 @@ enum class FBFormat : uint32_t
 	RGBA8888 = 4
 };
 
+// Persistent RDP render state that is set by SET_* commands and reused across frames.
+// This must be captured in savestates; without it the first draws after a load use stale
+// modes/colors/tile descriptors and render slightly differently. POD so it can be memcpy'd.
+struct RendererSavedState
+{
+	TileInfo tiles[Limits::MaxNumTiles];
+
+	ScissorState scissor_state;
+	StaticRasterizationState static_raster_state;
+	DepthBlendState depth_blend_state;
+
+	// Renderer::Constants
+	uint32_t blend_color;
+	uint32_t fog_color;
+	uint32_t env_color;
+	uint32_t primitive_color;
+	uint32_t fill_color;
+	uint8_t min_level;
+	uint8_t prim_lod_frac;
+	int32_t prim_depth;
+	uint16_t prim_dz;
+	uint16_t convert[6];
+	uint16_t key_width[3];
+	uint8_t key_center[3];
+	uint8_t key_scale[3];
+	bool use_prim_depth;
+
+	// Renderer::fb
+	uint32_t fb_addr;
+	uint32_t fb_depth_addr;
+	uint32_t fb_width;
+	uint32_t fb_deduced_height;
+	FBFormat fb_fmt;
+	bool fb_depth_write_pending;
+	bool fb_color_write_pending;
+
+	// Free-running primitive counter. Seeds the per-pixel noise/dither (see shading.h),
+	// so it must be restored or dithered pixels differ after a savestate load.
+	uint32_t base_primitive_index;
+};
+
 enum class UploadMode : uint32_t
 {
 	Tile = 0,
@@ -155,6 +196,10 @@ public:
 
 	void lock_command_processing();
 	void unlock_command_processing();
+
+	// Save/restore persistent render state (SET_* register state reused across frames) for savestates.
+	void save_render_state(RendererSavedState &state) const;
+	void restore_render_state(const RendererSavedState &state);
 
 private:
 	CommandProcessor &processor;
