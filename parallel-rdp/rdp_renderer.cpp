@@ -746,9 +746,6 @@ void Renderer::save_render_state(RendererSavedState &state) const
 
 void Renderer::restore_render_state(const RendererSavedState &state)
 {
-	// Any work queued against the previous state must be flushed before swapping it out.
-	flush_queues();
-
 	for (unsigned i = 0; i < Limits::MaxNumTiles; i++)
 		tiles[i] = state.tiles[i];
 
