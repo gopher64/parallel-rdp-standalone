@@ -140,6 +140,17 @@ public:
 	{
 		return timeline_value;
 	}
+
+	// See Renderer::set_texture_load_snapshot_filter. Only possible with
+	// single-threaded command processing, where loads are processed (and the
+	// filter called) inside enqueue_command(); returns false otherwise.
+	bool set_texture_load_snapshot_filter(Renderer::TextureLoadSnapshotFilter filter)
+	{
+		if (!single_threaded_processing)
+			return false;
+		renderer.set_texture_load_snapshot_filter(std::move(filter));
+		return true;
+	}
 	void idle();
 	void begin_frame_context();
 

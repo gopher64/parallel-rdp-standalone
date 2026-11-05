@@ -608,6 +608,11 @@ void Renderer::set_rdram(Vulkan::Buffer *buffer, uint8_t *host_rdram, size_t off
 	is_host_coherent = coherent;
 	device->set_name(*rdram, "rdram");
 
+	if (is_host_coherent)
+		snapshot_host_rdram = static_cast<const uint8_t *>(device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_READ_BIT)) + offset;
+	else
+		snapshot_host_rdram = host_rdram;
+
 	if (!is_host_coherent)
 	{
 		assert(rdram_offset == 0);
@@ -1707,7 +1712,16 @@ void Renderer::RenderBuffersUpdater::upload(Vulkan::Device &device, const Render
 void Renderer::update_tmem_instances(Vulkan::CommandBuffer &cmd)
 {
 	cmd.begin_region("tmem-update");
-	cmd.set_storage_buffer(0, 0, *rdram, rdram_offset, rdram_size);
+	if (stream.tmem_upload_source == StreamCaches::TMEMUploadSource::Snapshot)
+	{
+		// the uploads' vram_addr point into the snapshot copies
+		auto &snapshot = stream.tmem_upload_snapshot;
+		auto alloc = cmd.request_scratch_buffer_memory(snapshot.size());
+		memcpy(alloc.host, snapshot.data(), snapshot.size());
+		cmd.set_storage_buffer(0, 0, *alloc.buffer, alloc.offset, snapshot.size());
+	}
+	else
+		cmd.set_storage_buffer(0, 0, *rdram, rdram_offset, rdram_size);
 	cmd.set_storage_buffer(0, 1, *tmem);
 	cmd.set_storage_buffer(0, 2, *tmem_instances);
 
@@ -2557,6 +2571,8 @@ void Renderer::reset_context()
 	fb.depth_write_pending = false;
 
 	stream.tmem_upload_infos.clear();
+	stream.tmem_upload_source = StreamCaches::TMEMUploadSource::Any;
+	stream.tmem_upload_snapshot.clear();
 }
 
 void Renderer::begin_new_context()
@@ -3169,6 +3185,59 @@ bool Renderer::tmem_upload_needs_flush(uint32_t addr) const
 	return false;
 }
 
+void Renderer::set_texture_load_snapshot_filter(TextureLoadSnapshotFilter filter)
+{
+	texture_load_snapshot_filter = std::move(filter);
+}
+
+// Decides where one TMEM upload reads from, copying its source if the filter
+// allows. Returns the texture image address to compute vram_addr from: the
+// original one, or one rebased into the batch's snapshot buffer.
+uint32_t Renderer::snapshot_texture_load(const LoadTileInfo &info)
+{
+	using Source = StreamCaches::TMEMUploadSource;
+	if (!texture_load_snapshot_filter || !snapshot_host_rdram)
+		return info.tex_addr;
+
+	// the texels this upload reads, as in the incoherent path of load_tile()
+	unsigned pixel_count, offset_pixels;
+	if (info.mode == UploadMode::Block)
+	{
+		pixel_count = (info.shi - info.slo + 1) & 0xfff;
+		offset_pixels = info.slo + info.tex_width * info.tlo;
+	}
+	else
+	{
+		unsigned max_x = ((info.shi >> 2) - (info.slo >> 2)) & 0xfff;
+		unsigned max_y = (info.thi >> 2) - (info.tlo >> 2);
+		pixel_count = max_y * info.tex_width + max_x + 1;
+		offset_pixels = (info.slo >> 2) + info.tex_width * (info.tlo >> 2);
+	}
+
+	// Copy whole 64-byte chunks and keep their alignment in the copy, so any
+	// rounding in the shader stays inside the copy and the byte swizzle of
+	// unaligned reads (addr ^ 3) still lines up.
+	unsigned shift = unsigned(info.size) - 1;
+	uint32_t first = info.tex_addr + (offset_pixels << shift);
+	uint32_t src = first & ~63u;
+	uint32_t length = ((first + (pixel_count << shift) + 63u) & ~63u) - src;
+
+	bool snapshot = texture_load_snapshot_filter(src, length);
+	auto source = snapshot ? Source::Snapshot : Source::RDRAM;
+	if (stream.tmem_upload_source != source && !stream.tmem_upload_infos.empty())
+		flush_queues();
+	stream.tmem_upload_source = source;
+	if (!snapshot)
+		return info.tex_addr;
+
+	auto &data = stream.tmem_upload_snapshot;
+	size_t dst = data.size(); // stays a multiple of 64
+	data.resize(dst + length);
+	size_t avail = src < rdram_size ? std::min<size_t>(length, rdram_size - src) : 0;
+	memcpy(data.data() + dst, snapshot_host_rdram + src, avail);
+	return info.tex_addr - src + uint32_t(dst);
+}
+
 void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 {
 	if (validation_iface && info.mode == UploadMode::TLUT)
@@ -3542,7 +3611,7 @@ void Renderer::load_tile_iteration(uint32_t tile, const LoadTileInfo &info, uint
 		return;
 	}
 
-	upload.vram_addr = info.tex_addr + ((info.tex_width * upload_y + upload_x) << (unsigned(info.size) - 1));
+	upload.vram_addr = snapshot_texture_load(info) + ((info.tex_width * upload_y + upload_x) << (unsigned(info.size) - 1));
 	upload.vram_width = upload_mode == UploadMode::Block ? upload.vram_effective_width : info.tex_width;
 	upload.vram_size = int32_t(info.size);
 

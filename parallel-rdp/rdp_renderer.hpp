@@ -26,6 +26,7 @@
 #include "device.hpp"
 #include "rdp_common.hpp"
 #include "worker_thread.hpp"
+#include <functional>
 #include <unordered_set>
 
 namespace RDP
@@ -149,6 +150,17 @@ public:
 	void set_rdram(Vulkan::Buffer *buffer, uint8_t *host_rdram, size_t offset, size_t size, bool coherent);
 	void set_hidden_rdram(Vulkan::Buffer *buffer);
 	void set_tmem(Vulkan::Buffer *buffer);
+
+	// Texture load snapshots. Normally the GPU reads a TMEM load's source from
+	// RDRAM when it runs the load, so RDRAM writes made after the load was
+	// enqueued (but before the GPU got to it) leak into TMEM. If a filter is
+	// set, it is asked about the RDRAM range [addr, addr + length) of every
+	// load as the load is processed; when it returns true the range is copied
+	// right away and the GPU uploads TMEM from the copy. The filter must reject
+	// ranges with pending GPU writes (e.g. render-to-texture), since the copy
+	// is taken from host memory.
+	using TextureLoadSnapshotFilter = std::function<bool (uint32_t addr, uint32_t length)>;
+	void set_texture_load_snapshot_filter(TextureLoadSnapshotFilter filter);
 	void set_shader_bank(const ShaderBank *bank);
 
 	bool init_renderer(const RendererOptions &options);
@@ -230,6 +242,9 @@ private:
 	size_t rdram_offset = 0;
 	size_t rdram_size = 0;
 	bool is_host_coherent = false;
+	TextureLoadSnapshotFilter texture_load_snapshot_filter;
+	const uint8_t *snapshot_host_rdram = nullptr;
+	uint32_t snapshot_texture_load(const LoadTileInfo &info);
 	Vulkan::Buffer *hidden_rdram = nullptr;
 	Vulkan::Buffer *tmem = nullptr;
 	const ShaderBank *shader_bank = nullptr;
@@ -269,6 +284,11 @@ private:
 		StreamCache<SpanInterpolationJob, Limits::MaxSpanSetups> span_info_jobs;
 
 		std::vector<UploadInfo> tmem_upload_infos;
+		// where this batch's TMEM uploads read from; one source per batch
+		// since tmem_update binds a single buffer
+		enum class TMEMUploadSource { Any, RDRAM, Snapshot };
+		TMEMUploadSource tmem_upload_source = TMEMUploadSource::Any;
+		std::vector<uint8_t> tmem_upload_snapshot;
 		unsigned max_shaded_tiles = 0;
 		Vulkan::CommandBufferHandle cmd;
 	} stream;
