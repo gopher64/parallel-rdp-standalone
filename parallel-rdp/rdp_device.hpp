@@ -134,6 +134,12 @@ public:
 	{
 		return thread_timeline_value.load(std::memory_order_acquire);
 	}
+	// last value handed out by signal_timeline(); commands enqueued from now
+	// on are covered by the next one
+	uint64_t get_timeline_value() const
+	{
+		return timeline_value;
+	}
 	void idle();
 	void begin_frame_context();
 
