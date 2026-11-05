@@ -1209,7 +1209,7 @@ void CommandProcessor::scanout_sync(std::vector<RGBA> &colors, unsigned &width, 
 void CommandProcessor::FenceExecutor::notify_work_locked(const CoherencyOperation &work)
 {
 	if (work.timeline_value)
-		*value = work.timeline_value;
+		value->store(work.timeline_value, std::memory_order_release);
 }
 
 bool CommandProcessor::FenceExecutor::is_sentinel(const CoherencyOperation &work) const

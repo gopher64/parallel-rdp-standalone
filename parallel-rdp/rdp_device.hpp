@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <queue>
@@ -128,6 +129,11 @@ public:
 	void flush();
 	uint64_t signal_timeline();
 	void wait_for_timeline(uint64_t index);
+	// highest timeline value the GPU has completed, without blocking
+	uint64_t get_completed_timeline() const
+	{
+		return thread_timeline_value.load(std::memory_order_acquire);
+	}
 	void idle();
 	void begin_frame_context();
 
@@ -263,17 +269,17 @@ private:
 	} texture_image = {};
 
 	uint64_t timeline_value = 0;
-	uint64_t thread_timeline_value = 0;
+	std::atomic<uint64_t> thread_timeline_value{0};
 
 	struct FenceExecutor
 	{
-		explicit inline FenceExecutor(Vulkan::Device *device_, uint64_t *ptr)
+		explicit inline FenceExecutor(Vulkan::Device *device_, std::atomic<uint64_t> *ptr)
 			: device(device_), value(ptr)
 		{
 		}
 
 		Vulkan::Device *device;
-		uint64_t *value;
+		std::atomic<uint64_t> *value;
 		bool is_sentinel(const CoherencyOperation &work) const;
 		void perform_work(CoherencyOperation &work);
 		void notify_work_locked(const CoherencyOperation &work);
