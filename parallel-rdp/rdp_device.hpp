@@ -161,6 +161,11 @@ public:
 	void set_quirks(const Quirks &quirks);
 
 	// Interact with memory.
+	// False when RDRAM is synchronized through staging uploads and readbacks.
+	bool is_rdram_host_coherent() const
+	{
+		return is_host_coherent;
+	}
 	void *begin_read_rdram();
 	void end_write_rdram();
 	void *begin_read_hidden_rdram();
