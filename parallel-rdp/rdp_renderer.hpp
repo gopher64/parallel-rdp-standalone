@@ -260,6 +260,7 @@ private:
 		uint32_t depth_addr = 0;
 		uint32_t width = 0;
 		uint32_t deduced_height = 0;
+		uint32_t depth_write_height = 0;
 		FBFormat fmt = FBFormat::I8;
 		bool depth_write_pending = false;
 		bool color_write_pending = false;

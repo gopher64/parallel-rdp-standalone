@@ -777,6 +777,8 @@ void Renderer::restore_render_state(const RendererSavedState &state)
 	fb.depth_addr = state.fb_depth_addr;
 	fb.width = state.fb_width;
 	fb.deduced_height = state.fb_deduced_height;
+	// Save-state loads idle the renderer before restoring its state.
+	fb.depth_write_height = 0;
 	fb.fmt = state.fb_fmt;
 	fb.depth_write_pending = state.fb_depth_write_pending;
 	fb.color_write_pending = state.fb_color_write_pending;
@@ -1635,8 +1637,13 @@ void Renderer::update_deduced_height(const TriangleSetup &setup)
 {
 	int max_active_sub_scanline = std::min(setup.yl - 1, int(stream.scissor_state.yhi) - 1);
 	int max_active_line = max_active_sub_scanline >> 2;
-	int height = std::max(max_active_line + 1, 0);
-	fb.deduced_height = std::max(fb.deduced_height, uint32_t(height));
+	uint32_t height = std::max(max_active_line + 1, 0);
+	fb.deduced_height = std::max(fb.deduced_height, height);
+	bool writes_depth = (stream.depth_blend_state.flags & DEPTH_BLEND_DEPTH_UPDATE_BIT) != 0 &&
+	                    (setup.flags & TRIANGLE_SETUP_FILL_COPY_RASTER_BIT) == 0 &&
+	                    fb.depth_addr != fb.addr;
+	if (writes_depth)
+		fb.depth_write_height = std::max(fb.depth_write_height, height);
 }
 
 bool Renderer::need_flush() const
@@ -2567,6 +2574,7 @@ void Renderer::reset_context()
 	stream.max_shaded_tiles = 0;
 
 	fb.deduced_height = 0;
+	fb.depth_write_height = 0;
 	fb.color_write_pending = false;
 	fb.depth_write_pending = false;
 
@@ -3011,7 +3019,8 @@ void Renderer::flush_queues()
 
 		// We're going to write to these pages, so lock them down.
 		lock_pages_for_gpu_write(fb.addr, get_byte_size_for_bound_color_framebuffer());
-		lock_pages_for_gpu_write(fb.depth_addr, get_byte_size_for_bound_depth_framebuffer());
+		// Color-only draws can extend the batch height without writing depth.
+		lock_pages_for_gpu_write(fb.depth_addr, fb.width * fb.depth_write_height * 2);
 	}
 
 	auto &instance = buffer_instances[buffer_instance];
