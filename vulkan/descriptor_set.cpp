@@ -255,7 +255,7 @@ DescriptorSetAllocator::DescriptorSetAllocator(Hash hash, Device *device_, const
 
 	// Push descriptors is not used with descriptor buffer.
 	if (!bindless && device->get_device_features().vk14_features.pushDescriptor &&
-	    !heap && !device->get_device_features().descriptor_buffer_features.descriptorBuffer)
+	    !heap && !device->get_device_features().supports_descriptor_buffer)
 	{
 		info.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
 		if (table.vkCreateDescriptorSetLayout(device->get_device(), &info, nullptr, &set_layout_push) != VK_SUCCESS)
