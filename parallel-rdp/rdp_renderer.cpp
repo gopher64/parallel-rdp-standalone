@@ -2822,38 +2822,38 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 	Util::SmallVector<uint32_t, 1024> masked_page_copies;
 	Util::SmallVector<uint32_t, 1024> to_clear_write_mask;
 
-	// If we're able to map RDRAM directly, we can just memcpy straight into RDRAM if we have an unmasked copy.
-	// Important for iGPU.
+	// Queue uploads even when device RDRAM is host visible. Earlier GPU
+	// commands can still be using pages that have no pending writeback.
 	if (rdram->get_allocation().is_host_allocation())
 	{
+		bool queued_direct_upload = false;
 		for (auto &direct : incoherent.page_to_direct_copy)
 		{
-			uint32_t base_index = 32 * (&direct - incoherent.page_to_direct_copy.data());
+			size_t packed_index = &direct - incoherent.page_to_direct_copy.data();
+			direct &= ~incoherent.page_to_masked_copy[packed_index];
+			if (direct && !queued_direct_upload)
+			{
+				cmd.barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+				            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+				queued_direct_upload = true;
+			}
+
+			uint32_t base_index = 32 * packed_index;
 			Util::for_each_bit_range(direct, [&](unsigned index, unsigned count) {
-				index += base_index;
-				auto *mapped_rdram = device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT,
-				                                             ImplementationConstants::IncoherentPageSize * index,
-				                                             ImplementationConstants::IncoherentPageSize * count);
-				memcpy(mapped_rdram,
-				       incoherent.host_rdram + ImplementationConstants::IncoherentPageSize * index,
-				       ImplementationConstants::IncoherentPageSize * count);
-
-				device->unmap_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT,
-				                          ImplementationConstants::IncoherentPageSize * index,
-				                          ImplementationConstants::IncoherentPageSize * count);
-
-				mapped_rdram = device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT,
-				                                       ImplementationConstants::IncoherentPageSize * index + rdram_size,
-				                                       ImplementationConstants::IncoherentPageSize * count);
-
-				memset(mapped_rdram, 0, ImplementationConstants::IncoherentPageSize * count);
-
-				device->unmap_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT,
-				                          ImplementationConstants::IncoherentPageSize * index + rdram_size,
-				                          ImplementationConstants::IncoherentPageSize * count);
+				VkDeviceSize offset = ImplementationConstants::IncoherentPageSize * (base_index + index);
+				VkDeviceSize size = ImplementationConstants::IncoherentPageSize * count;
+				auto *upload = cmd.update_buffer(*rdram, offset, size);
+				VK_ASSERT(upload);
+				memcpy(upload, incoherent.host_rdram + offset, size);
+				cmd.fill_buffer(*rdram, 0, rdram_size + offset, size);
 			});
 			direct = 0;
 		}
+
+		if (queued_direct_upload)
+			cmd.barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+			            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+			            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
 		auto *mapped_staging = static_cast<uint8_t *>(device->map_host_buffer(*incoherent.staging_rdram,
 		                                                                      Vulkan::MEMORY_ACCESS_WRITE_BIT));
