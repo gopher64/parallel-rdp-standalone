@@ -3199,52 +3199,47 @@ void Renderer::set_texture_load_snapshot_filter(TextureLoadSnapshotFilter filter
 	texture_load_snapshot_filter = std::move(filter);
 }
 
-// Decides where one TMEM upload reads from, copying its source if the filter
-// allows. Returns the texture image address to compute vram_addr from: the
-// original one, or one rebased into the batch's snapshot buffer.
-uint32_t Renderer::snapshot_texture_load(const LoadTileInfo &info)
+void Renderer::prepare_tmem_upload(UploadInfo &upload)
 {
 	using Source = StreamCaches::TMEMUploadSource;
-	if (!texture_load_snapshot_filter || !snapshot_host_rdram)
-		return info.tex_addr;
 
-	// the texels this upload reads, as in the incoherent path of load_tile()
-	unsigned pixel_count, offset_pixels;
-	if (info.mode == UploadMode::Block)
+	uint32_t addr = upload.vram_addr;
+	unsigned bytes_per_texel = 1u << (upload.vram_size - 1);
+	// The shader fetches whole 64-bit groups. The effective VRAM width
+	// includes that padding, while the source pitch is still in texels.
+	unsigned row_bytes = upload.vram_effective_width * bytes_per_texel;
+	if (upload.mode == int32_t(UploadMode::TLUT))
 	{
-		pixel_count = (info.shi - info.slo + 1) & 0xfff;
-		offset_pixels = info.slo + info.tex_width * info.tlo;
-	}
-	else
-	{
-		unsigned max_x = ((info.shi >> 2) - (info.slo >> 2)) & 0xfff;
-		unsigned max_y = (info.thi >> 2) - (info.tlo >> 2);
-		pixel_count = max_y * info.tex_width + max_x + 1;
-		offset_pixels = (info.slo >> 2) + info.tex_width * (info.tlo >> 2);
+		// TLUT reads 16-bit words and can fetch four consecutive words
+		// from an unaligned address (update_tmem_lut in tmem_update.comp).
+		row_bytes = (upload.vram_effective_width - 1) * bytes_per_texel + 2;
+		if (bytes_per_texel == 1 || (addr & 1))
+			row_bytes += 6;
 	}
 
-	// Copy whole 64-byte chunks and keep their alignment in the copy, so any
-	// rounding in the shader stays inside the copy and the byte swizzle of
-	// unaligned reads (addr ^ 3) still lines up.
-	unsigned shift = unsigned(info.size) - 1;
-	uint32_t first = info.tex_addr + (offset_pixels << shift);
-	uint32_t src = first & ~63u;
-	uint32_t length = ((first + (pixel_count << shift) + 63u) & ~63u) - src;
+	// Keep the original alignment, including the byte swizzle (addr ^ 3).
+	uint32_t src = addr & ~63u;
+	uint32_t end = addr + (upload.height - 1) * upload.vram_width * bytes_per_texel + row_bytes;
+	uint32_t length = ((end + 63u) & ~63u) - src;
 
-	bool snapshot = texture_load_snapshot_filter(src, length);
+	bool snapshot = texture_load_snapshot_filter && snapshot_host_rdram &&
+	                texture_load_snapshot_filter(src, length);
 	auto source = snapshot ? Source::Snapshot : Source::RDRAM;
 	if (stream.tmem_upload_source != source && !stream.tmem_upload_infos.empty())
 		flush_queues();
 	stream.tmem_upload_source = source;
-	if (!snapshot)
-		return info.tex_addr;
 
-	auto &data = stream.tmem_upload_snapshot;
-	size_t dst = data.size(); // stays a multiple of 64
-	data.resize(dst + length);
-	size_t avail = src < rdram_size ? std::min<size_t>(length, rdram_size - src) : 0;
-	memcpy(data.data() + dst, snapshot_host_rdram + src, avail);
-	return info.tex_addr - src + uint32_t(dst);
+	if (snapshot)
+	{
+		auto &data = stream.tmem_upload_snapshot;
+		size_t dst = data.size(); // stays a multiple of 64
+		data.resize(dst + length);
+		if (src < rdram_size)
+			memcpy(data.data() + dst, snapshot_host_rdram + src, std::min<size_t>(length, rdram_size - src));
+		upload.vram_addr = uint32_t(dst) + addr - src;
+	}
+	else if (!is_host_coherent)
+		mark_pages_for_gpu_read(src, length);
 }
 
 void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
@@ -3276,31 +3271,6 @@ void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 		unsigned pixel_count = ((info.shi - info.slo) + 1) & 0xfff;
 		if (!pixel_count || pixel_count > 2048)
 			return;
-	}
-
-	if (!is_host_coherent)
-	{
-		unsigned pixel_count;
-		unsigned offset_pixels;
-		unsigned base_addr = info.tex_addr;
-
-		if (info.mode == UploadMode::Block)
-		{
-			pixel_count = (info.shi - info.slo + 1) & 0xfff;
-			offset_pixels = info.slo + info.tex_width * info.tlo;
-		}
-		else
-		{
-			unsigned max_x = ((info.shi >> 2) - (info.slo >> 2)) & 0xfff;
-			unsigned max_y = (info.thi >> 2) - (info.tlo >> 2);
-			pixel_count = max_y * info.tex_width + max_x + 1;
-			offset_pixels = (info.slo >> 2) + info.tex_width * (info.tlo >> 2);
-		}
-
-		unsigned byte_size = pixel_count << (unsigned(info.size) - 1);
-		byte_size = (byte_size + 7) & ~7;
-		base_addr += offset_pixels << (unsigned(info.size) - 1);
-		mark_pages_for_gpu_read(base_addr, byte_size);
 	}
 
 	if (info.mode == UploadMode::Tile)
@@ -3620,7 +3590,7 @@ void Renderer::load_tile_iteration(uint32_t tile, const LoadTileInfo &info, uint
 		return;
 	}
 
-	upload.vram_addr = snapshot_texture_load(info) + ((info.tex_width * upload_y + upload_x) << (unsigned(info.size) - 1));
+	upload.vram_addr = info.tex_addr + ((info.tex_width * upload_y + upload_x) << (unsigned(info.size) - 1));
 	upload.vram_width = upload_mode == UploadMode::Block ? upload.vram_effective_width : info.tex_width;
 	upload.vram_size = int32_t(info.size);
 
@@ -3631,6 +3601,7 @@ void Renderer::load_tile_iteration(uint32_t tile, const LoadTileInfo &info, uint
 
 	upload.inv_tmem_stride_words = 1.0f / float(upload.tmem_stride_words);
 
+	prepare_tmem_upload(upload);
 	stream.tmem_upload_infos.push_back(upload);
 	if (stream.tmem_upload_infos.size() + 1 >= Limits::MaxTMEMInstances)
 		flush_queues();

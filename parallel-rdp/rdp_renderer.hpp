@@ -244,7 +244,7 @@ private:
 	bool is_host_coherent = false;
 	TextureLoadSnapshotFilter texture_load_snapshot_filter;
 	const uint8_t *snapshot_host_rdram = nullptr;
-	uint32_t snapshot_texture_load(const LoadTileInfo &info);
+	void prepare_tmem_upload(UploadInfo &upload);
 	Vulkan::Buffer *hidden_rdram = nullptr;
 	Vulkan::Buffer *tmem = nullptr;
 	const ShaderBank *shader_bank = nullptr;
