@@ -3146,52 +3146,15 @@ void Renderer::notify_idle_command_thread()
 	maintain_queues_idle();
 }
 
-bool Renderer::tmem_upload_needs_flush(uint32_t addr) const
+bool Renderer::tmem_upload_needs_flush(uint32_t addr, uint32_t length) const
 {
-	// Not perfect, since TMEM upload could slice into framebuffer,
-	// but I doubt this will be an issue (famous last words ...)
+	uint32_t mask = uint32_t(rdram_size - 1);
+	auto overlaps = [&](uint32_t base, uint32_t size) {
+		return size != 0 && (((addr - base) & mask) < size || ((base - addr) & mask) < length);
+	};
 
-	if (fb.color_write_pending)
-	{
-		uint32_t offset = (addr - fb.addr) & (rdram_size - 1);
-		uint32_t pending_pixels = fb.deduced_height * fb.width;
-
-		switch (fb.fmt)
-		{
-		case FBFormat::RGBA5551:
-		case FBFormat::I8:
-			offset >>= 1;
-			break;
-
-		case FBFormat::RGBA8888:
-			offset >>= 2;
-			break;
-
-		default:
-			break;
-		}
-
-		if (offset < pending_pixels)
-		{
-			//LOGI("Flushing render pass due to coherent TMEM fetch from color buffer.\n");
-			return true;
-		}
-	}
-
-	if (fb.depth_write_pending)
-	{
-		uint32_t offset = (addr - fb.depth_addr) & (rdram_size - 1);
-		uint32_t pending_pixels = fb.deduced_height * fb.width;
-		offset >>= 1;
-
-		if (offset < pending_pixels)
-		{
-			//LOGI("Flushing render pass due to coherent TMEM fetch from depth buffer.\n");
-			return true;
-		}
-	}
-
-	return false;
+	return (fb.color_write_pending && overlaps(fb.addr, get_byte_size_for_bound_color_framebuffer())) ||
+	       (fb.depth_write_pending && overlaps(fb.depth_addr, get_byte_size_for_bound_depth_framebuffer()));
 }
 
 void Renderer::set_texture_load_snapshot_filter(TextureLoadSnapshotFilter filter)
@@ -3221,6 +3184,11 @@ void Renderer::prepare_tmem_upload(UploadInfo &upload)
 	uint32_t src = addr & ~63u;
 	uint32_t end = addr + (upload.height - 1) * upload.vram_width * bytes_per_texel + row_bytes;
 	uint32_t length = ((end + 63u) & ~63u) - src;
+
+	// TMEM uploads run before draws in a batch, so finish any earlier draw
+	// that writes into the source range before queuing this upload.
+	if (tmem_upload_needs_flush(src, length))
+		flush_queues();
 
 	bool snapshot = texture_load_snapshot_filter && snapshot_host_rdram &&
 	                texture_load_snapshot_filter(src, length);
@@ -3252,9 +3220,6 @@ void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 			                                   "Attempting to load multiple lines in TLUT.");
 		}
 	}
-
-	if (tmem_upload_needs_flush(info.tex_addr))
-		flush_queues();
 
 	// Detect noop cases.
 	if (info.mode != UploadMode::Block)

@@ -387,7 +387,7 @@ private:
 	unsigned pending_primitives = 0;
 	unsigned pending_primitives_upscaled = 0;
 
-	bool tmem_upload_needs_flush(uint32_t addr) const;
+	bool tmem_upload_needs_flush(uint32_t addr, uint32_t length) const;
 
 	bool render_pass_is_upscaled() const;
 	bool should_render_upscaled() const;
