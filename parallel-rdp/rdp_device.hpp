@@ -151,6 +151,12 @@ public:
 		renderer.set_texture_load_snapshot_filter(std::move(filter));
 		return true;
 	}
+
+	void set_rdram_write_mask_clear_callback(Renderer::RdramWriteMaskClearCallback callback)
+	{
+		if (single_threaded_processing)
+			renderer.set_rdram_write_mask_clear_callback(callback);
+	}
 	void idle();
 	void begin_frame_context();
 

@@ -2803,6 +2803,20 @@ const Vulkan::Buffer *Renderer::get_upscaled_hidden_rdram_buffer() const
 	return upscaling_multisampled_hidden_rdram.get();
 }
 
+void Renderer::notify_rdram_write_mask_clear(uint32_t first_page, uint32_t count)
+{
+	if (!rdram_write_mask_clear_callback)
+		return;
+
+	uint64_t completed = processor.get_completed_timeline();
+	for (uint32_t page = first_page; page < first_page + count; page++)
+	{
+		// An intervening submission can queue a readback before the clear.
+		if (incoherent.pending_writes_for_page[page].load(std::memory_order_acquire) == 0)
+			rdram_write_mask_clear_callback(page, completed);
+	}
+}
+
 void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 {
 	// Now, ensure that the GPU sees a coherent view of the CPU memory writes up until now.
@@ -2846,6 +2860,7 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 				VK_ASSERT(upload);
 				memcpy(upload, incoherent.host_rdram + offset, size);
 				cmd.fill_buffer(*rdram, 0, rdram_size + offset, size);
+				notify_rdram_write_mask_clear(base_index + index, count);
 			});
 			direct = 0;
 		}
@@ -2965,6 +2980,10 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 				   to_copy * sizeof(uint32_t));
 			cmd.dispatch(to_copy, 1, 1);
 		}
+
+		if (rdram_write_mask_clear_callback)
+			for (auto page : to_clear_write_mask)
+				notify_rdram_write_mask_clear(page, 1);
 	}
 
 	if (!to_clear_write_mask.empty() || !masked_page_copies.empty())

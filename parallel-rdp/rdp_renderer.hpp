@@ -161,6 +161,14 @@ public:
 	// is taken from host memory.
 	using TextureLoadSnapshotFilter = std::function<bool (uint32_t addr, uint32_t length)>;
 	void set_texture_load_snapshot_filter(TextureLoadSnapshotFilter filter);
+
+	// A direct upload clears the write mask before drawing. Report pages with
+	// no outstanding readback and the timeline completed when notified.
+	using RdramWriteMaskClearCallback = void (*)(uint32_t page, uint64_t completed);
+	void set_rdram_write_mask_clear_callback(RdramWriteMaskClearCallback callback)
+	{
+		rdram_write_mask_clear_callback = callback;
+	}
 	void set_shader_bank(const ShaderBank *bank);
 
 	bool init_renderer(const RendererOptions &options);
@@ -243,6 +251,7 @@ private:
 	size_t rdram_size = 0;
 	bool is_host_coherent = false;
 	TextureLoadSnapshotFilter texture_load_snapshot_filter;
+	RdramWriteMaskClearCallback rdram_write_mask_clear_callback = nullptr;
 	const uint8_t *snapshot_host_rdram = nullptr;
 	void prepare_tmem_upload(UploadInfo &upload);
 	Vulkan::Buffer *hidden_rdram = nullptr;
@@ -476,6 +485,7 @@ private:
 	uint32_t get_byte_size_for_bound_depth_framebuffer() const;
 	void mark_pages_for_gpu_read(uint32_t base_addr, uint32_t byte_count);
 	void lock_pages_for_gpu_write(uint32_t base_addr, uint32_t byte_count);
+	void notify_rdram_write_mask_clear(uint32_t first_page, uint32_t count);
 
 	std::atomic_uint32_t active_submissions;
 	void enqueue_fence_wait(Vulkan::Fence fence);
